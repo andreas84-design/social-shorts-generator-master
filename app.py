@@ -17,6 +17,10 @@ R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_REGION = os.environ.get("R2_REGION", "auto")
 
+# Config rotazione (4 short x 4 giorni x 10 canali = 160/settimana + buffer)
+MAX_CLIPS_RETENTION = int(os.environ.get("MAX_CLIPS_RETENTION", "200"))
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "7"))
+
 def get_s3_client():
     """Client S3 per Cloudflare R2"""
     endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -30,6 +34,62 @@ def get_s3_client():
         config=Config(s3={"addressing_style": "virtual"}),
     )
 
+def cleanup_old_clips(s3_client):
+    """
+    Rotazione clip R2:
+    - Cancella clip più vecchie di RETENTION_DAYS giorni
+    - Mantiene max MAX_CLIPS_RETENTION clip totali
+    """
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="social-clips/")
+        
+        all_clips = []
+        for page in pages:
+            if "Contents" not in page:
+                continue
+            for obj in page["Contents"]:
+                if obj["Key"].endswith(".mp4"):
+                    all_clips.append({
+                        "Key": obj["Key"],
+                        "LastModified": obj["LastModified"]
+                    })
+        
+        if not all_clips:
+            print("✅ Nessuna clip da pulire", flush=True)
+            return
+        
+        # Ordina per data (più vecchie prime)
+        all_clips.sort(key=lambda x: x["LastModified"])
+        
+        now = dt.datetime.now(dt.timezone.utc)
+        retention_cutoff = now - dt.timedelta(days=RETENTION_DAYS)
+        deleted_count = 0
+        
+        # Strategia 1: Cancella clip più vecchie di RETENTION_DAYS
+        for clip in all_clips:
+            if clip["LastModified"] < retention_cutoff:
+                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clip["Key"])
+                deleted_count += 1
+                print(f"🗑️ Cancellato (>{RETENTION_DAYS}gg): {clip['Key']}", flush=True)
+        
+        # Strategia 2: Se ancora troppi, cancella i più vecchi fino a MAX
+        remaining_clips = [c for c in all_clips if c["LastModified"] >= retention_cutoff]
+        if len(remaining_clips) > MAX_CLIPS_RETENTION:
+            to_delete = remaining_clips[:len(remaining_clips) - MAX_CLIPS_RETENTION]
+            for clip in to_delete:
+                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clip["Key"])
+                deleted_count += 1
+                print(f"🗑️ Cancellato (max limit): {clip['Key']}", flush=True)
+        
+        if deleted_count > 0:
+            print(f"✅ Rotazione completata: {deleted_count} clip cancellate", flush=True)
+        else:
+            print("✅ Nessuna clip da cancellare", flush=True)
+            
+    except Exception as e:
+        print(f"⚠️ Errore rotazione R2: {str(e)}", flush=True)
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "service": "social-shorts-generator"})
@@ -41,6 +101,7 @@ def process_social_video():
     1. Download con yt-dlp
     2. Taglia 4 clip verticali 9:16
     3. Upload su R2
+    4. Rotazione clip vecchie
     """
     video_path = None
     clip_paths = []
@@ -60,7 +121,7 @@ def process_social_video():
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
         # STEP 1: Download video
-        print("📥 Step 1/3: Downloading video...", flush=True)
+        print("📥 Step 1/4: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
         video_tmp.close()
@@ -84,7 +145,7 @@ def process_social_video():
         ]
         
         # STEP 3: Taglia clip verticali + upload R2
-        print("✂️ Step 2/3: Cutting & uploading clips...", flush=True)
+        print("✂️ Step 2/4: Cutting & uploading clips...", flush=True)
         s3_client = get_s3_client()
         today = dt.datetime.utcnow().strftime("%Y-%m-%d")
         clips_data = []
@@ -127,6 +188,10 @@ def process_social_video():
             clip_paths.append(clip_path)
             print(f"   ✅ Clip {i}/4: {moment['duration']}s → R2", flush=True)
         
+        # STEP 4: Rotazione clip vecchie
+        print("🗑️ Step 3/4: Cleaning old clips...", flush=True)
+        cleanup_old_clips(s3_client)
+        
         print(f"✅ AGENTE SOCIAL COMPLETED: 4 clips generated!", flush=True)
         print("=" * 80, flush=True)
         
@@ -145,7 +210,7 @@ def process_social_video():
         return jsonify({"success": False, "error": str(e)}), 500
     
     finally:
-        # Cleanup
+        # Cleanup file temporanei
         for path in [video_path] + clip_paths:
             if path and os.path.exists(path):
                 try:
