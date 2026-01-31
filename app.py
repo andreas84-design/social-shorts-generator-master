@@ -161,10 +161,20 @@ def debug():
         debug_info["ffprobe_error"] = str(e)
         debug_info["ffprobe_installed"] = False
     
-    # Test download semplice
+    # Test Node.js
+    try:
+        result = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
+        debug_info["nodejs_version"] = result.stdout.strip()
+        debug_info["nodejs_installed"] = True
+    except Exception as e:
+        debug_info["nodejs_error"] = str(e)
+        debug_info["nodejs_installed"] = False
+    
+    # Test download semplice con iOS client
     try:
         result = subprocess.run([
             "yt-dlp",
+            "--extractor-args", "youtube:player_client=ios",
             "--print", "title",
             "https://www.youtube.com/watch?v=jNQXAC9IVRw"
         ], capture_output=True, text=True, timeout=30)
@@ -172,7 +182,7 @@ def debug():
         debug_info["test_download"] = {
             "success": result.returncode == 0,
             "title": result.stdout.strip(),
-            "error": result.stderr if result.returncode != 0 else None
+            "stderr": result.stderr[:200] if result.stderr else None
         }
     except Exception as e:
         debug_info["test_download"] = {
@@ -202,7 +212,7 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video
+        # STEP 1: Download video con client iOS (no JavaScript required)
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
@@ -210,8 +220,10 @@ def process_social_video():
         
         print(f"   Temp file path: {video_path}", flush=True)
         
+        # yt-dlp con client iOS/Web (bypassa necessità di JavaScript)
         download_result = subprocess.run([
             "yt-dlp",
+            "--extractor-args", "youtube:player_client=ios,web",
             "-f", "best[height<=1080]",
             "-o", video_path,
             "--no-playlist",
@@ -220,14 +232,20 @@ def process_social_video():
         ], timeout=300, capture_output=True, text=True, check=False)
         
         print(f"   yt-dlp return code: {download_result.returncode}", flush=True)
-        print(f"   yt-dlp stdout: {download_result.stdout[:300]}", flush=True)
         
-        if download_result.stderr:
-            print(f"   yt-dlp stderr: {download_result.stderr[:300]}", flush=True)
+        # Log solo prime 300 char per non intasare log
+        if download_result.stdout:
+            stdout_preview = download_result.stdout[:300].replace('\n', ' ')
+            print(f"   yt-dlp output: {stdout_preview}", flush=True)
+        
+        if download_result.stderr and "WARNING" not in download_result.stderr:
+            stderr_preview = download_result.stderr[:300].replace('\n', ' ')
+            print(f"   yt-dlp errors: {stderr_preview}", flush=True)
         
         if download_result.returncode != 0:
-            raise Exception(f"yt-dlp failed: {download_result.stderr[:500]}")
+            raise Exception(f"yt-dlp failed with code {download_result.returncode}: {download_result.stderr[:500]}")
         
+        # Verifica file scaricato
         print(f"   File exists: {os.path.exists(video_path)}", flush=True)
         
         if not os.path.exists(video_path):
@@ -237,22 +255,27 @@ def process_social_video():
         print(f"   File size: {video_size_mb:.3f}MB", flush=True)
         
         if video_size_mb < 0.1:
-            raise Exception(f"Downloaded video too small: {video_size_mb:.3f}MB")
+            raise Exception(
+                f"Downloaded video too small: {video_size_mb:.3f}MB. "
+                f"Video potrebbe essere privato, geo-bloccato o con age restriction."
+            )
         
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
         
-        # STEP 2: Analizza durata
+        # STEP 2: Analizza durata video
         print("⏱️ Step 2/5: Analyzing duration...", flush=True)
         total_duration = get_video_duration(video_path)
         print(f"✅ Duration: {total_duration:.1f}s ({total_duration/60:.1f} min)", flush=True)
         
-        if total_duration < 180:
+        # Verifica durata minima
+        min_duration = 180
+        if total_duration < min_duration:
             return jsonify({
                 "success": False,
-                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno 180s."
+                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno {min_duration}s (3 min)."
             }), 400
         
-        # STEP 3: Timestamp dinamici
+        # STEP 3: Calcola timestamp dinamici
         print("📍 Step 3/5: Calculating timestamps...", flush=True)
         clip_duration = 45
         safety_margin = 60
@@ -272,8 +295,8 @@ def process_social_video():
         timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
         print(f"   Timestamps: {timestamps_str}", flush=True)
         
-        # STEP 4: Taglia clips + upload
-        print("✂️ Step 4/5: Cutting & uploading...", flush=True)
+        # STEP 4: Taglia clip verticali + upload R2
+        print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
         s3_client = get_s3_client()
         today = dt.datetime.utcnow().strftime("%Y-%m-%d")
         clips_data = []
@@ -283,6 +306,7 @@ def process_social_video():
             clip_path = clip_tmp.name
             clip_tmp.close()
             
+            # Taglia clip verticale 1080x1920 (9:16)
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", str(moment["start"]),
@@ -294,9 +318,11 @@ def process_social_video():
                 clip_path
             ], check=True, timeout=120)
             
+            # Verifica clip creata
             if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
                 raise Exception(f"Failed to create clip {i}")
             
+            # Upload R2
             object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
             s3_client.upload_file(
                 Filename=clip_path,
@@ -316,13 +342,13 @@ def process_social_video():
             
             clip_paths.append(clip_path)
             clip_size = os.path.getsize(clip_path) / 1024 / 1024
-            print(f"   ✅ Clip {i}/4: {clip_size:.1f}MB", flush=True)
+            print(f"   ✅ Clip {i}/4: {clip_size:.1f}MB → R2", flush=True)
         
-        # STEP 5: Cleanup
-        print("🗑️ Step 5/5: Cleaning...", flush=True)
+        # STEP 5: Rotazione clip vecchie
+        print("🗑️ Step 5/5: Cleaning old clips...", flush=True)
         cleanup_old_clips(s3_client)
         
-        print(f"✅ COMPLETED!", flush=True)
+        print(f"✅ AGENTE SOCIAL COMPLETED: 4 clips generated!", flush=True)
         print("=" * 80, flush=True)
         
         return jsonify({
@@ -334,19 +360,26 @@ def process_social_video():
             "clips_count": len(clips_data)
         })
     
+    except subprocess.TimeoutExpired as e:
+        print(f"❌ TIMEOUT ERROR: {e}", flush=True)
+        return jsonify({"success": False, "error": f"Processing timeout: {str(e)}"}), 500
+    except subprocess.CalledProcessError as e:
+        print(f"❌ COMMAND ERROR: {e}", flush=True)
+        return jsonify({"success": False, "error": f"Command failed: {str(e)}"}), 500
     except Exception as e:
-        print(f"❌ ERROR: {e}", flush=True)
+        print(f"❌ GENERAL ERROR: {e}", flush=True)
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
     
     finally:
+        # Cleanup file temporanei
         for path in [video_path] + clip_paths:
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ Cleanup warning: {e}", flush=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
