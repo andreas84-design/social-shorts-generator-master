@@ -90,6 +90,17 @@ def cleanup_old_clips(s3_client):
     except Exception as e:
         print(f"⚠️ Errore rotazione R2: {str(e)}", flush=True)
 
+def get_video_duration(video_path):
+    """Ottiene durata video in secondi usando ffprobe"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(result.stdout.strip())
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "service": "social-shorts-generator"})
@@ -99,9 +110,11 @@ def process_social_video():
     """
     Processa video YouTube per Agente Social:
     1. Download con yt-dlp
-    2. Taglia 4 clip verticali 9:16
-    3. Upload su R2
-    4. Rotazione clip vecchie
+    2. Analizza durata video
+    3. Calcola timestamp dinamici
+    4. Taglia 4 clip verticali 9:16
+    5. Upload su R2
+    6. Rotazione clip vecchie
     """
     video_path = None
     clip_paths = []
@@ -121,7 +134,7 @@ def process_social_video():
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
         # STEP 1: Download video
-        print("📥 Step 1/4: Downloading video...", flush=True)
+        print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
         video_tmp.close()
@@ -134,18 +147,45 @@ def process_social_video():
             video_url
         ], check=True, timeout=300)
         
-        print(f"✅ Video downloaded: {os.path.getsize(video_path)/1024/1024:.1f}MB", flush=True)
+        video_size_mb = os.path.getsize(video_path) / 1024 / 1024
+        print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
         
-        # STEP 2: Momenti predefiniti (dopo implementeremo AI)
-        clips_moments = [
-            {"start": "00:00:10", "duration": 45, "caption": "Hook iniziale"},
-            {"start": "00:05:30", "duration": 50, "caption": "Momento chiave"},
-            {"start": "00:12:00", "duration": 40, "caption": "Valore centrale"},
-            {"start": "00:18:30", "duration": 48, "caption": "CTA finale"}
-        ]
+        # STEP 2: Analizza durata video
+        print("⏱️ Step 2/5: Analyzing video duration...", flush=True)
+        total_duration = get_video_duration(video_path)
+        print(f"✅ Video duration: {total_duration:.1f}s ({total_duration/60:.1f} min)", flush=True)
         
-        # STEP 3: Taglia clip verticali + upload R2
-        print("✂️ Step 2/4: Cutting & uploading clips...", flush=True)
+        # Verifica durata minima (almeno 3 minuti per 4 clip)
+        min_duration = 180  # 3 minuti
+        if total_duration < min_duration:
+            return jsonify({
+                "success": False,
+                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno {min_duration}s (3 min)."
+            }), 400
+        
+        # STEP 3: Calcola timestamp dinamici
+        print("📍 Step 3/5: Calculating clip timestamps...", flush=True)
+        clip_duration = 45  # Durata fissa ogni clip (45 sec)
+        safety_margin = 60  # Margine finale per evitare tagli bruschi
+        usable_duration = total_duration - safety_margin - clip_duration
+        
+        # Distribuisce 4 clip uniformemente nel video
+        clips_moments = []
+        captions = ["Hook iniziale", "Momento chiave", "Valore centrale", "CTA finale"]
+        
+        for i in range(4):
+            # Divide video in 5 sezioni, prende clip da sezione i+1
+            start_seconds = int((usable_duration / 5) * (i + 1))
+            clips_moments.append({
+                "start": start_seconds,
+                "duration": clip_duration,
+                "caption": captions[i]
+            })
+        
+        print(f"   Timestamps: {[f'{c['start']}s' for c in clips_moments]}", flush=True)
+        
+        # STEP 4: Taglia clip verticali + upload R2
+        print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
         s3_client = get_s3_client()
         today = dt.datetime.utcnow().strftime("%Y-%m-%d")
         clips_data = []
@@ -158,7 +198,7 @@ def process_social_video():
             # Taglia clip verticale 1080x1920 (9:16)
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", moment["start"],
+                "-ss", str(moment["start"]),
                 "-i", video_path,
                 "-t", str(moment["duration"]),
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
@@ -182,14 +222,15 @@ def process_social_video():
                 "storage_url": public_url,
                 "duration": f"00:00:{moment['duration']}",
                 "caption": moment["caption"],
-                "start_time": moment["start"]
+                "start_time": f"00:{moment['start']//60:02d}:{moment['start']%60:02d}"
             })
             
             clip_paths.append(clip_path)
-            print(f"   ✅ Clip {i}/4: {moment['duration']}s → R2", flush=True)
+            clip_size = os.path.getsize(clip_path) / 1024 / 1024
+            print(f"   ✅ Clip {i}/4: {moment['duration']}s @ {moment['start']}s → R2 ({clip_size:.1f}MB)", flush=True)
         
-        # STEP 4: Rotazione clip vecchie
-        print("🗑️ Step 3/4: Cleaning old clips...", flush=True)
+        # STEP 5: Rotazione clip vecchie
+        print("🗑️ Step 5/5: Cleaning old clips...", flush=True)
         cleanup_old_clips(s3_client)
         
         print(f"✅ AGENTE SOCIAL COMPLETED: 4 clips generated!", flush=True)
@@ -199,12 +240,15 @@ def process_social_video():
             "success": True,
             "video_id": video_id,
             "canale_id": canale_id,
+            "video_duration": total_duration,
             "clips": clips_data,
             "clips_count": len(clips_data)
         })
     
     except subprocess.TimeoutExpired:
         return jsonify({"success": False, "error": "Processing timeout"}), 500
+    except subprocess.CalledProcessError as e:
+        return jsonify({"success": False, "error": f"Command failed: {str(e)}"}), 500
     except Exception as e:
         print(f"❌ ERROR: {e}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
