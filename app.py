@@ -3,6 +3,7 @@ import tempfile
 import subprocess
 import uuid
 import datetime as dt
+import json
 from flask import Flask, request, jsonify
 import boto3
 from botocore.config import Config
@@ -91,15 +92,53 @@ def cleanup_old_clips(s3_client):
         print(f"⚠️ Errore rotazione R2: {str(e)}", flush=True)
 
 def get_video_duration(video_path):
-    """Ottiene durata video in secondi usando ffprobe"""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(result.stdout.strip())
+    """Ottiene durata video in secondi usando ffprobe con error handling robusto"""
+    try:
+        # Verifica file esiste e non è vuoto
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        file_size = os.path.getsize(video_path)
+        if file_size < 1024:
+            raise ValueError(f"Video file too small: {file_size} bytes")
+        
+        print(f"   Analyzing video file: {file_size/1024/1024:.1f}MB", flush=True)
+        
+        # Usa ffprobe con output JSON per parsing robusto
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        
+        data = json.loads(result.stdout)
+        
+        # Prova a prendere durata da format (più affidabile)
+        if 'format' in data and 'duration' in data['format']:
+            duration = float(data['format']['duration'])
+            if duration > 0:
+                return duration
+        
+        # Fallback: cerca nel primo stream video
+        if 'streams' in data:
+            for stream in data['streams']:
+                if stream.get('codec_type') == 'video' and 'duration' in stream:
+                    duration = float(stream['duration'])
+                    if duration > 0:
+                        return duration
+        
+        raise ValueError("Duration not found in video metadata")
+        
+    except json.JSONDecodeError as e:
+        raise Exception(f"Failed to parse ffprobe output: {str(e)}")
+    except subprocess.TimeoutExpired:
+        raise Exception("ffprobe timeout - video might be corrupted")
+    except Exception as e:
+        raise Exception(f"Failed to get video duration: {str(e)}")
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -109,7 +148,7 @@ def health():
 def process_social_video():
     """
     Processa video YouTube per Agente Social:
-    1. Download con yt-dlp
+    1. Download con yt-dlp (formato robusto)
     2. Analizza durata video
     3. Calcola timestamp dinamici
     4. Taglia 4 clip verticali 9:16
@@ -133,21 +172,32 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video
+        # STEP 1: Download video con yt-dlp (formato ottimizzato)
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
         video_tmp.close()
         
-        subprocess.run([
+        # yt-dlp con opzioni robuste: forza mp4, merge audio/video
+        download_result = subprocess.run([
             "yt-dlp",
-            "-f", "best[height<=1080]",
+            "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
+            "--merge-output-format", "mp4",
             "-o", video_path,
             "--no-playlist",
+            "--no-check-certificate",
             video_url
-        ], check=True, timeout=300)
+        ], check=True, timeout=300, capture_output=True, text=True)
+        
+        # Verifica file scaricato
+        if not os.path.exists(video_path):
+            raise Exception("yt-dlp completed but video file not found")
         
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
+        
+        if video_size_mb < 0.1:
+            raise Exception(f"Downloaded video too small: {video_size_mb:.2f}MB")
+        
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
         
         # STEP 2: Analizza durata video
@@ -184,7 +234,6 @@ def process_social_video():
         
         timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
         print(f"   Timestamps: {timestamps_str}", flush=True)
-
         
         # STEP 4: Taglia clip verticali + upload R2
         print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
@@ -208,6 +257,10 @@ def process_social_video():
                 "-c:a", "aac", "-b:a", "128k",
                 clip_path
             ], check=True, timeout=120)
+            
+            # Verifica clip creata
+            if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
+                raise Exception(f"Failed to create clip {i}")
             
             # Upload R2
             object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
@@ -247,12 +300,17 @@ def process_social_video():
             "clips_count": len(clips_data)
         })
     
-    except subprocess.TimeoutExpired:
-        return jsonify({"success": False, "error": "Processing timeout"}), 500
+    except subprocess.TimeoutExpired as e:
+        print(f"❌ TIMEOUT ERROR: {e}", flush=True)
+        return jsonify({"success": False, "error": f"Processing timeout: {str(e)}"}), 500
     except subprocess.CalledProcessError as e:
+        print(f"❌ COMMAND ERROR: {e}", flush=True)
+        print(f"   STDERR: {e.stderr if hasattr(e, 'stderr') else 'N/A'}", flush=True)
         return jsonify({"success": False, "error": f"Command failed: {str(e)}"}), 500
     except Exception as e:
-        print(f"❌ ERROR: {e}", flush=True)
+        print(f"❌ GENERAL ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
     
     finally:
@@ -261,8 +319,8 @@ def process_social_video():
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ Cleanup failed for {path}: {e}", flush=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
