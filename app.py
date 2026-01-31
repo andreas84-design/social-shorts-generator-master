@@ -18,7 +18,7 @@ R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_REGION = os.environ.get("R2_REGION", "auto")
 
-# Config rotazione (4 short x 4 giorni x 10 canali = 160/settimana + buffer)
+# Config rotazione
 MAX_CLIPS_RETENTION = int(os.environ.get("MAX_CLIPS_RETENTION", "200"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "7"))
 
@@ -36,11 +36,7 @@ def get_s3_client():
     )
 
 def cleanup_old_clips(s3_client):
-    """
-    Rotazione clip R2:
-    - Cancella clip più vecchie di RETENTION_DAYS giorni
-    - Mantiene max MAX_CLIPS_RETENTION clip totali
-    """
+    """Rotazione clip R2"""
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="social-clips/")
@@ -60,21 +56,18 @@ def cleanup_old_clips(s3_client):
             print("✅ Nessuna clip da pulire", flush=True)
             return
         
-        # Ordina per data (più vecchie prime)
         all_clips.sort(key=lambda x: x["LastModified"])
         
         now = dt.datetime.now(dt.timezone.utc)
         retention_cutoff = now - dt.timedelta(days=RETENTION_DAYS)
         deleted_count = 0
         
-        # Strategia 1: Cancella clip più vecchie di RETENTION_DAYS
         for clip in all_clips:
             if clip["LastModified"] < retention_cutoff:
                 s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clip["Key"])
                 deleted_count += 1
                 print(f"🗑️ Cancellato (>{RETENTION_DAYS}gg): {clip['Key']}", flush=True)
         
-        # Strategia 2: Se ancora troppi, cancella i più vecchi fino a MAX
         remaining_clips = [c for c in all_clips if c["LastModified"] >= retention_cutoff]
         if len(remaining_clips) > MAX_CLIPS_RETENTION:
             to_delete = remaining_clips[:len(remaining_clips) - MAX_CLIPS_RETENTION]
@@ -92,9 +85,8 @@ def cleanup_old_clips(s3_client):
         print(f"⚠️ Errore rotazione R2: {str(e)}", flush=True)
 
 def get_video_duration(video_path):
-    """Ottiene durata video in secondi usando ffprobe con error handling robusto"""
+    """Ottiene durata video in secondi"""
     try:
-        # Verifica file esiste e non è vuoto
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
@@ -104,7 +96,6 @@ def get_video_duration(video_path):
         
         print(f"   Analyzing video file: {file_size/1024/1024:.1f}MB", flush=True)
         
-        # Usa ffprobe con output JSON per parsing robusto
         cmd = [
             "ffprobe",
             "-v", "quiet",
@@ -117,13 +108,11 @@ def get_video_duration(video_path):
         
         data = json.loads(result.stdout)
         
-        # Prova a prendere durata da format (più affidabile)
         if 'format' in data and 'duration' in data['format']:
             duration = float(data['format']['duration'])
             if duration > 0:
                 return duration
         
-        # Fallback: cerca nel primo stream video
         if 'streams' in data:
             for stream in data['streams']:
                 if stream.get('codec_type') == 'video' and 'duration' in stream:
@@ -133,10 +122,6 @@ def get_video_duration(video_path):
         
         raise ValueError("Duration not found in video metadata")
         
-    except json.JSONDecodeError as e:
-        raise Exception(f"Failed to parse ffprobe output: {str(e)}")
-    except subprocess.TimeoutExpired:
-        raise Exception("ffprobe timeout - video might be corrupted")
     except Exception as e:
         raise Exception(f"Failed to get video duration: {str(e)}")
 
@@ -144,219 +129,9 @@ def get_video_duration(video_path):
 def health():
     return jsonify({"status": "healthy", "service": "social-shorts-generator"})
 
-@app.route("/process-social-video", methods=["POST"])
-def process_social_video():
-    """
-    Processa video YouTube per Agente Social:
-    1. Download con yt-dlp (formato robusto)
-    2. Analizza durata video
-    3. Calcola timestamp dinamici
-    4. Taglia 4 clip verticali 9:16
-    5. Upload su R2
-    6. Rotazione clip vecchie
-    """
-    video_path = None
-    clip_paths = []
-    
-    try:
-        data = request.get_json(force=True) or {}
-        video_url = data.get("video_url")
-        video_id = data.get("video_id", "unknown")
-        canale_id = data.get("canale_id", "unknown")
-        
-        if not video_url:
-            return jsonify({"success": False, "error": "video_url required"}), 400
-        
-        print("=" * 80, flush=True)
-        print(f"🎬 AGENTE SOCIAL START", flush=True)
-        print(f"📹 Video: {video_url}", flush=True)
-        print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
-        
-        # STEP 1: Download video con yt-dlp
-        print("📥 Step 1/5: Downloading video...", flush=True)
-        video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        video_path = video_tmp.name
-        video_tmp.close()
-        
-        print(f"   Temp file path: {video_path}", flush=True)
-        
-        # yt-dlp con logging dettagliato
-        try:
-            download_result = subprocess.run([
-                "yt-dlp",
-                "-f", "best[height<=1080]",
-                "-o", video_path,
-                "--no-playlist",
-                "--no-check-certificate",
-                "--print", "after_move:filepath",  # Print path dopo download
-                video_url
-            ], timeout=300, capture_output=True, text=True, check=False)
-            
-            print(f"   yt-dlp return code: {download_result.returncode}", flush=True)
-            print(f"   yt-dlp stdout: {download_result.stdout[:500]}", flush=True)
-            
-            if download_result.stderr:
-                print(f"   yt-dlp stderr: {download_result.stderr[:500]}", flush=True)
-            
-            # Verifica se yt-dlp ha fallito
-            if download_result.returncode != 0:
-                raise Exception(f"yt-dlp failed with code {download_result.returncode}: {download_result.stderr}")
-            
-        except subprocess.TimeoutExpired:
-            raise Exception("yt-dlp timeout after 5 minutes")
-        
-        # Verifica file scaricato
-        print(f"   Checking downloaded file...", flush=True)
-        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
-        
-        if not os.path.exists(video_path):
-            raise Exception(f"yt-dlp completed but video file not found at {video_path}")
-        
-        video_size_mb = os.path.getsize(video_path) / 1024 / 1024
-        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
-        
-        if video_size_mb < 0.1:
-            # File vuoto - prova a vedere cosa c'è nella directory temp
-            temp_dir = os.path.dirname(video_path)
-            temp_files = os.listdir(temp_dir)
-            print(f"   Temp directory content: {temp_files[:10]}", flush=True)
-            
-            raise Exception(
-                f"Downloaded video too small ({video_size_mb:.3f}MB). "
-                f"Video potrebbe essere privato, geo-bloccato o con age restriction. "
-                f"URL: {video_url}"
-            )
-        
-        print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
-
-        
-        # STEP 2: Analizza durata video
-        print("⏱️ Step 2/5: Analyzing video duration...", flush=True)
-        total_duration = get_video_duration(video_path)
-        print(f"✅ Video duration: {total_duration:.1f}s ({total_duration/60:.1f} min)", flush=True)
-        
-        # Verifica durata minima (almeno 3 minuti per 4 clip)
-        min_duration = 180  # 3 minuti
-        if total_duration < min_duration:
-            return jsonify({
-                "success": False,
-                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno {min_duration}s (3 min)."
-            }), 400
-        
-        # STEP 3: Calcola timestamp dinamici
-        print("📍 Step 3/5: Calculating clip timestamps...", flush=True)
-        clip_duration = 45  # Durata fissa ogni clip (45 sec)
-        safety_margin = 60  # Margine finale per evitare tagli bruschi
-        usable_duration = total_duration - safety_margin - clip_duration
-        
-        # Distribuisce 4 clip uniformemente nel video
-        clips_moments = []
-        captions = ["Hook iniziale", "Momento chiave", "Valore centrale", "CTA finale"]
-        
-        for i in range(4):
-            # Divide video in 5 sezioni, prende clip da sezione i+1
-            start_seconds = int((usable_duration / 5) * (i + 1))
-            clips_moments.append({
-                "start": start_seconds,
-                "duration": clip_duration,
-                "caption": captions[i]
-            })
-        
-        timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
-        print(f"   Timestamps: {timestamps_str}", flush=True)
-        
-        # STEP 4: Taglia clip verticali + upload R2
-        print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
-        s3_client = get_s3_client()
-        today = dt.datetime.utcnow().strftime("%Y-%m-%d")
-        clips_data = []
-        
-        for i, moment in enumerate(clips_moments, 1):
-            clip_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            clip_path = clip_tmp.name
-            clip_tmp.close()
-            
-            # Taglia clip verticale 1080x1920 (9:16)
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", str(moment["start"]),
-                "-i", video_path,
-                "-t", str(moment["duration"]),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                clip_path
-            ], check=True, timeout=120)
-            
-            # Verifica clip creata
-            if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
-                raise Exception(f"Failed to create clip {i}")
-            
-            # Upload R2
-            object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
-            s3_client.upload_file(
-                Filename=clip_path,
-                Bucket=R2_BUCKET_NAME,
-                Key=object_key,
-                ExtraArgs={"ContentType": "video/mp4"}
-            )
-            
-            public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
-            clips_data.append({
-                "clip_number": i,
-                "storage_url": public_url,
-                "duration": f"00:00:{moment['duration']}",
-                "caption": moment["caption"],
-                "start_time": f"00:{moment['start']//60:02d}:{moment['start']%60:02d}"
-            })
-            
-            clip_paths.append(clip_path)
-            clip_size = os.path.getsize(clip_path) / 1024 / 1024
-            print(f"   ✅ Clip {i}/4: {moment['duration']}s @ {moment['start']}s → R2 ({clip_size:.1f}MB)", flush=True)
-        
-        # STEP 5: Rotazione clip vecchie
-        print("🗑️ Step 5/5: Cleaning old clips...", flush=True)
-        cleanup_old_clips(s3_client)
-        
-        print(f"✅ AGENTE SOCIAL COMPLETED: 4 clips generated!", flush=True)
-        print("=" * 80, flush=True)
-        
-        return jsonify({
-            "success": True,
-            "video_id": video_id,
-            "canale_id": canale_id,
-            "video_duration": total_duration,
-            "clips": clips_data,
-            "clips_count": len(clips_data)
-        })
-    
-    except subprocess.TimeoutExpired as e:
-        print(f"❌ TIMEOUT ERROR: {e}", flush=True)
-        return jsonify({"success": False, "error": f"Processing timeout: {str(e)}"}), 500
-    except subprocess.CalledProcessError as e:
-        print(f"❌ COMMAND ERROR: {e}", flush=True)
-        print(f"   STDERR: {e.stderr if hasattr(e, 'stderr') else 'N/A'}", flush=True)
-        return jsonify({"success": False, "error": f"Command failed: {str(e)}"}), 500
-    except Exception as e:
-        print(f"❌ GENERAL ERROR: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-    
-    finally:
-        # Cleanup file temporanei
-        for path in [video_path] + clip_paths:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception as e:
-                    print(f"⚠️ Cleanup failed for {path}: {e}", flush=True)
-
-        @app.route("/debug", methods=["GET"])
+@app.route("/debug", methods=["GET"])
 def debug():
     """Endpoint debug per verificare tools installati"""
-    import subprocess
-    
     debug_info = {}
     
     # Test yt-dlp
@@ -406,6 +181,172 @@ def debug():
         }
     
     return jsonify(debug_info)
+
+@app.route("/process-social-video", methods=["POST"])
+def process_social_video():
+    """Processa video YouTube per Agente Social"""
+    video_path = None
+    clip_paths = []
+    
+    try:
+        data = request.get_json(force=True) or {}
+        video_url = data.get("video_url")
+        video_id = data.get("video_id", "unknown")
+        canale_id = data.get("canale_id", "unknown")
+        
+        if not video_url:
+            return jsonify({"success": False, "error": "video_url required"}), 400
+        
+        print("=" * 80, flush=True)
+        print(f"🎬 AGENTE SOCIAL START", flush=True)
+        print(f"📹 Video: {video_url}", flush=True)
+        print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
+        
+        # STEP 1: Download video
+        print("📥 Step 1/5: Downloading video...", flush=True)
+        video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        video_path = video_tmp.name
+        video_tmp.close()
+        
+        print(f"   Temp file path: {video_path}", flush=True)
+        
+        download_result = subprocess.run([
+            "yt-dlp",
+            "-f", "best[height<=1080]",
+            "-o", video_path,
+            "--no-playlist",
+            "--no-check-certificate",
+            video_url
+        ], timeout=300, capture_output=True, text=True, check=False)
+        
+        print(f"   yt-dlp return code: {download_result.returncode}", flush=True)
+        print(f"   yt-dlp stdout: {download_result.stdout[:300]}", flush=True)
+        
+        if download_result.stderr:
+            print(f"   yt-dlp stderr: {download_result.stderr[:300]}", flush=True)
+        
+        if download_result.returncode != 0:
+            raise Exception(f"yt-dlp failed: {download_result.stderr[:500]}")
+        
+        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
+        
+        if not os.path.exists(video_path):
+            raise Exception(f"Video file not found at {video_path}")
+        
+        video_size_mb = os.path.getsize(video_path) / 1024 / 1024
+        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
+        
+        if video_size_mb < 0.1:
+            raise Exception(f"Downloaded video too small: {video_size_mb:.3f}MB")
+        
+        print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
+        
+        # STEP 2: Analizza durata
+        print("⏱️ Step 2/5: Analyzing duration...", flush=True)
+        total_duration = get_video_duration(video_path)
+        print(f"✅ Duration: {total_duration:.1f}s ({total_duration/60:.1f} min)", flush=True)
+        
+        if total_duration < 180:
+            return jsonify({
+                "success": False,
+                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno 180s."
+            }), 400
+        
+        # STEP 3: Timestamp dinamici
+        print("📍 Step 3/5: Calculating timestamps...", flush=True)
+        clip_duration = 45
+        safety_margin = 60
+        usable_duration = total_duration - safety_margin - clip_duration
+        
+        clips_moments = []
+        captions = ["Hook iniziale", "Momento chiave", "Valore centrale", "CTA finale"]
+        
+        for i in range(4):
+            start_seconds = int((usable_duration / 5) * (i + 1))
+            clips_moments.append({
+                "start": start_seconds,
+                "duration": clip_duration,
+                "caption": captions[i]
+            })
+        
+        timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
+        print(f"   Timestamps: {timestamps_str}", flush=True)
+        
+        # STEP 4: Taglia clips + upload
+        print("✂️ Step 4/5: Cutting & uploading...", flush=True)
+        s3_client = get_s3_client()
+        today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+        clips_data = []
+        
+        for i, moment in enumerate(clips_moments, 1):
+            clip_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            clip_path = clip_tmp.name
+            clip_tmp.close()
+            
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", str(moment["start"]),
+                "-i", video_path,
+                "-t", str(moment["duration"]),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                clip_path
+            ], check=True, timeout=120)
+            
+            if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
+                raise Exception(f"Failed to create clip {i}")
+            
+            object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
+            s3_client.upload_file(
+                Filename=clip_path,
+                Bucket=R2_BUCKET_NAME,
+                Key=object_key,
+                ExtraArgs={"ContentType": "video/mp4"}
+            )
+            
+            public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
+            clips_data.append({
+                "clip_number": i,
+                "storage_url": public_url,
+                "duration": f"00:00:{moment['duration']}",
+                "caption": moment["caption"],
+                "start_time": f"00:{moment['start']//60:02d}:{moment['start']%60:02d}"
+            })
+            
+            clip_paths.append(clip_path)
+            clip_size = os.path.getsize(clip_path) / 1024 / 1024
+            print(f"   ✅ Clip {i}/4: {clip_size:.1f}MB", flush=True)
+        
+        # STEP 5: Cleanup
+        print("🗑️ Step 5/5: Cleaning...", flush=True)
+        cleanup_old_clips(s3_client)
+        
+        print(f"✅ COMPLETED!", flush=True)
+        print("=" * 80, flush=True)
+        
+        return jsonify({
+            "success": True,
+            "video_id": video_id,
+            "canale_id": canale_id,
+            "video_duration": total_duration,
+            "clips": clips_data,
+            "clips_count": len(clips_data)
+        })
+    
+    except Exception as e:
+        print(f"❌ ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+    
+    finally:
+        for path in [video_path] + clip_paths:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except:
+                    pass
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
