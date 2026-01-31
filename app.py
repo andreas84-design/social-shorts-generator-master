@@ -170,12 +170,13 @@ def debug():
         debug_info["nodejs_error"] = str(e)
         debug_info["nodejs_installed"] = False
     
-    # Test download semplice con iOS client
+    # Test download semplice
     try:
         result = subprocess.run([
             "yt-dlp",
-            "--extractor-args", "youtube:player_client=ios",
             "--print", "title",
+            "--quiet",
+            "--no-warnings",
             "https://www.youtube.com/watch?v=jNQXAC9IVRw"
         ], capture_output=True, text=True, timeout=30)
         
@@ -212,53 +213,41 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video con client iOS (no JavaScript required)
+        # STEP 1: Download video
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
         video_tmp.close()
         
-        print(f"   Temp file path: {video_path}", flush=True)
+        print(f"   Temp file: {video_path}", flush=True)
         
-        # yt-dlp con client iOS/Web (bypassa necessità di JavaScript)
+        # yt-dlp con formato semplice (default client con fallback automatici)
         download_result = subprocess.run([
             "yt-dlp",
-            "--extractor-args", "youtube:player_client=ios,web",
-            "-f", "best[height<=1080]",
+            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best",
+            "--merge-output-format", "mp4",
             "-o", video_path,
             "--no-playlist",
-            "--no-check-certificate",
+            "--quiet",
+            "--no-warnings",
             video_url
         ], timeout=300, capture_output=True, text=True, check=False)
         
-        print(f"   yt-dlp return code: {download_result.returncode}", flush=True)
-        
-        # Log solo prime 300 char per non intasare log
-        if download_result.stdout:
-            stdout_preview = download_result.stdout[:300].replace('\n', ' ')
-            print(f"   yt-dlp output: {stdout_preview}", flush=True)
-        
-        if download_result.stderr and "WARNING" not in download_result.stderr:
-            stderr_preview = download_result.stderr[:300].replace('\n', ' ')
-            print(f"   yt-dlp errors: {stderr_preview}", flush=True)
+        print(f"   yt-dlp exit code: {download_result.returncode}", flush=True)
         
         if download_result.returncode != 0:
-            raise Exception(f"yt-dlp failed with code {download_result.returncode}: {download_result.stderr[:500]}")
+            print(f"   yt-dlp stderr: {download_result.stderr[:500]}", flush=True)
+            raise Exception(f"yt-dlp download failed (code {download_result.returncode})")
         
         # Verifica file scaricato
-        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
-        
         if not os.path.exists(video_path):
-            raise Exception(f"Video file not found at {video_path}")
+            raise Exception("Video file not created")
         
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
-        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
+        print(f"   File size: {video_size_mb:.2f}MB", flush=True)
         
-        if video_size_mb < 0.1:
-            raise Exception(
-                f"Downloaded video too small: {video_size_mb:.3f}MB. "
-                f"Video potrebbe essere privato, geo-bloccato o con age restriction."
-            )
+        if video_size_mb < 0.5:
+            raise Exception(f"Downloaded video too small: {video_size_mb:.2f}MB")
         
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
         
@@ -307,6 +296,7 @@ def process_social_video():
             clip_tmp.close()
             
             # Taglia clip verticale 1080x1920 (9:16)
+            print(f"   Cutting clip {i}/4...", flush=True)
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", str(moment["start"]),
@@ -323,6 +313,7 @@ def process_social_video():
                 raise Exception(f"Failed to create clip {i}")
             
             # Upload R2
+            print(f"   Uploading clip {i}/4 to R2...", flush=True)
             object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
             s3_client.upload_file(
                 Filename=clip_path,
