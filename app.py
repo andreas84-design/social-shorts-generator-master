@@ -161,29 +161,19 @@ def debug():
         debug_info["ffprobe_error"] = str(e)
         debug_info["ffprobe_installed"] = False
     
-    # Test Node.js
-    try:
-        result = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
-        debug_info["nodejs_version"] = result.stdout.strip()
-        debug_info["nodejs_installed"] = True
-    except Exception as e:
-        debug_info["nodejs_error"] = str(e)
-        debug_info["nodejs_installed"] = False
-    
     # Test download semplice
     try:
         result = subprocess.run([
             "yt-dlp",
             "--print", "title",
-            "--quiet",
-            "--no-warnings",
+            "--verbose",
             "https://www.youtube.com/watch?v=jNQXAC9IVRw"
         ], capture_output=True, text=True, timeout=30)
         
         debug_info["test_download"] = {
             "success": result.returncode == 0,
-            "title": result.stdout.strip(),
-            "stderr": result.stderr[:200] if result.stderr else None
+            "title": result.stdout.strip()[:100],
+            "stderr_preview": result.stderr[-500:] if result.stderr else None
         }
     except Exception as e:
         debug_info["test_download"] = {
@@ -213,7 +203,7 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video
+        # STEP 1: Download video con verbose logging
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
@@ -221,33 +211,59 @@ def process_social_video():
         
         print(f"   Temp file: {video_path}", flush=True)
         
-        # yt-dlp con formato semplice (default client con fallback automatici)
+        # yt-dlp con verbose per debug completo
         download_result = subprocess.run([
             "yt-dlp",
-            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best",
-            "--merge-output-format", "mp4",
+            "-f", "best[height<=1080]",
             "-o", video_path,
             "--no-playlist",
-            "--quiet",
-            "--no-warnings",
+            "--verbose",
             video_url
         ], timeout=300, capture_output=True, text=True, check=False)
         
         print(f"   yt-dlp exit code: {download_result.returncode}", flush=True)
         
-        if download_result.returncode != 0:
-            print(f"   yt-dlp stderr: {download_result.stderr[:500]}", flush=True)
-            raise Exception(f"yt-dlp download failed (code {download_result.returncode})")
+        # Log stdout (ultime 1000 chars)
+        if download_result.stdout:
+            print("   yt-dlp STDOUT (last 1000 chars):", flush=True)
+            stdout_tail = download_result.stdout[-1000:]
+            for line in stdout_tail.split('\n'):
+                if line.strip():
+                    print(f"     {line}", flush=True)
         
-        # Verifica file scaricato
+        # Log stderr (ultime 1000 chars)
+        if download_result.stderr:
+            print("   yt-dlp STDERR (last 1000 chars):", flush=True)
+            stderr_tail = download_result.stderr[-1000:]
+            for line in stderr_tail.split('\n'):
+                if line.strip():
+                    print(f"     {line}", flush=True)
+        
+        if download_result.returncode != 0:
+            raise Exception(f"yt-dlp failed with exit code {download_result.returncode}")
+        
+        # Verifica file esistenza
+        print(f"   Checking file...", flush=True)
+        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
+        
         if not os.path.exists(video_path):
-            raise Exception("Video file not created")
+            # Lista file temp directory per debug
+            temp_dir = os.path.dirname(video_path)
+            try:
+                temp_files = os.listdir(temp_dir)
+                print(f"   Temp dir contents: {[f for f in temp_files if 'tmp' in f][:10]}", flush=True)
+            except:
+                pass
+            raise Exception("Video file not created by yt-dlp")
         
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
-        print(f"   File size: {video_size_mb:.2f}MB", flush=True)
+        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
         
         if video_size_mb < 0.5:
-            raise Exception(f"Downloaded video too small: {video_size_mb:.2f}MB")
+            raise Exception(
+                f"Downloaded video too small: {video_size_mb:.3f}MB. "
+                f"Video might be unavailable, geo-restricted, or require authentication."
+            )
         
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
         
@@ -296,7 +312,7 @@ def process_social_video():
             clip_tmp.close()
             
             # Taglia clip verticale 1080x1920 (9:16)
-            print(f"   Cutting clip {i}/4...", flush=True)
+            print(f"   Cutting clip {i}/4 (start: {moment['start']}s, duration: {moment['duration']}s)...", flush=True)
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", str(moment["start"]),
