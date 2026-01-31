@@ -203,7 +203,7 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video con verbose logging
+        # STEP 1: Download video
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
@@ -211,49 +211,43 @@ def process_social_video():
         
         print(f"   Temp file: {video_path}", flush=True)
         
-        # yt-dlp con verbose per debug completo
+        # yt-dlp con force overwrites e no-continue
         download_result = subprocess.run([
             "yt-dlp",
             "-f", "best[height<=1080]",
             "-o", video_path,
             "--no-playlist",
-            "--verbose",
+            "--force-overwrites",
+            "--no-continue",
             video_url
         ], timeout=300, capture_output=True, text=True, check=False)
         
         print(f"   yt-dlp exit code: {download_result.returncode}", flush=True)
         
-        # Log stdout (ultime 1000 chars)
+        # Log stdout se presente
         if download_result.stdout:
-            print("   yt-dlp STDOUT (last 1000 chars):", flush=True)
-            stdout_tail = download_result.stdout[-1000:]
-            for line in stdout_tail.split('\n'):
-                if line.strip():
+            stdout_lines = [l for l in download_result.stdout.split('\n') if l.strip()][-10:]
+            if stdout_lines:
+                print("   yt-dlp output (last 10 lines):", flush=True)
+                for line in stdout_lines:
                     print(f"     {line}", flush=True)
         
-        # Log stderr (ultime 1000 chars)
+        # Log stderr se presente
         if download_result.stderr:
-            print("   yt-dlp STDERR (last 1000 chars):", flush=True)
-            stderr_tail = download_result.stderr[-1000:]
-            for line in stderr_tail.split('\n'):
-                if line.strip():
+            stderr_lines = [l for l in download_result.stderr.split('\n') if l.strip()][-10:]
+            if stderr_lines:
+                print("   yt-dlp errors (last 10 lines):", flush=True)
+                for line in stderr_lines:
                     print(f"     {line}", flush=True)
         
         if download_result.returncode != 0:
             raise Exception(f"yt-dlp failed with exit code {download_result.returncode}")
         
-        # Verifica file esistenza
+        # Verifica file
         print(f"   Checking file...", flush=True)
         print(f"   File exists: {os.path.exists(video_path)}", flush=True)
         
         if not os.path.exists(video_path):
-            # Lista file temp directory per debug
-            temp_dir = os.path.dirname(video_path)
-            try:
-                temp_files = os.listdir(temp_dir)
-                print(f"   Temp dir contents: {[f for f in temp_files if 'tmp' in f][:10]}", flush=True)
-            except:
-                pass
             raise Exception("Video file not created by yt-dlp")
         
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
@@ -266,7 +260,7 @@ def process_social_video():
             )
         
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
-        
+    
         # STEP 2: Analizza durata video
         print("⏱️ Step 2/5: Analyzing duration...", flush=True)
         total_duration = get_video_duration(video_path)
