@@ -182,7 +182,9 @@ def process_social_video():
                 "caption": captions[i]
             })
         
-        print(f"   Timestamps: {[f'{c['start']}s' for c in clips_moments]}", flush=True)
+        timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
+        print(f"   Timestamps: {timestamps_str}", flush=True)
+
         
         # STEP 4: Taglia clip verticali + upload R2
         print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
