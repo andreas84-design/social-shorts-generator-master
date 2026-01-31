@@ -352,6 +352,61 @@ def process_social_video():
                 except Exception as e:
                     print(f"⚠️ Cleanup failed for {path}: {e}", flush=True)
 
+        @app.route("/debug", methods=["GET"])
+def debug():
+    """Endpoint debug per verificare tools installati"""
+    import subprocess
+    
+    debug_info = {}
+    
+    # Test yt-dlp
+    try:
+        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
+        debug_info["yt-dlp_version"] = result.stdout.strip()
+        debug_info["yt-dlp_installed"] = True
+    except Exception as e:
+        debug_info["yt-dlp_error"] = str(e)
+        debug_info["yt-dlp_installed"] = False
+    
+    # Test ffmpeg
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        debug_info["ffmpeg_version"] = result.stdout.split('\n')[0]
+        debug_info["ffmpeg_installed"] = True
+    except Exception as e:
+        debug_info["ffmpeg_error"] = str(e)
+        debug_info["ffmpeg_installed"] = False
+    
+    # Test ffprobe
+    try:
+        result = subprocess.run(["ffprobe", "-version"], capture_output=True, text=True, timeout=5)
+        debug_info["ffprobe_version"] = result.stdout.split('\n')[0]
+        debug_info["ffprobe_installed"] = True
+    except Exception as e:
+        debug_info["ffprobe_error"] = str(e)
+        debug_info["ffprobe_installed"] = False
+    
+    # Test download semplice
+    try:
+        result = subprocess.run([
+            "yt-dlp",
+            "--print", "title",
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        ], capture_output=True, text=True, timeout=30)
+        
+        debug_info["test_download"] = {
+            "success": result.returncode == 0,
+            "title": result.stdout.strip(),
+            "error": result.stderr if result.returncode != 0 else None
+        }
+    except Exception as e:
+        debug_info["test_download"] = {
+            "success": False,
+            "error": str(e)
+        }
+    
+    return jsonify(debug_info)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
