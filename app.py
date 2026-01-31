@@ -172,33 +172,63 @@ def process_social_video():
         print(f"📹 Video: {video_url}", flush=True)
         print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
         
-        # STEP 1: Download video con yt-dlp (formato ottimizzato)
+        # STEP 1: Download video con yt-dlp
         print("📥 Step 1/5: Downloading video...", flush=True)
         video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_path = video_tmp.name
         video_tmp.close()
         
-        # yt-dlp con opzioni robuste: forza mp4, merge audio/video
-        download_result = subprocess.run([
-            "yt-dlp",
-            "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
-            "--merge-output-format", "mp4",
-            "-o", video_path,
-            "--no-playlist",
-            "--no-check-certificate",
-            video_url
-        ], check=True, timeout=300, capture_output=True, text=True)
+        print(f"   Temp file path: {video_path}", flush=True)
+        
+        # yt-dlp con logging dettagliato
+        try:
+            download_result = subprocess.run([
+                "yt-dlp",
+                "-f", "best[height<=1080]",
+                "-o", video_path,
+                "--no-playlist",
+                "--no-check-certificate",
+                "--print", "after_move:filepath",  # Print path dopo download
+                video_url
+            ], timeout=300, capture_output=True, text=True, check=False)
+            
+            print(f"   yt-dlp return code: {download_result.returncode}", flush=True)
+            print(f"   yt-dlp stdout: {download_result.stdout[:500]}", flush=True)
+            
+            if download_result.stderr:
+                print(f"   yt-dlp stderr: {download_result.stderr[:500]}", flush=True)
+            
+            # Verifica se yt-dlp ha fallito
+            if download_result.returncode != 0:
+                raise Exception(f"yt-dlp failed with code {download_result.returncode}: {download_result.stderr}")
+            
+        except subprocess.TimeoutExpired:
+            raise Exception("yt-dlp timeout after 5 minutes")
         
         # Verifica file scaricato
+        print(f"   Checking downloaded file...", flush=True)
+        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
+        
         if not os.path.exists(video_path):
-            raise Exception("yt-dlp completed but video file not found")
+            raise Exception(f"yt-dlp completed but video file not found at {video_path}")
         
         video_size_mb = os.path.getsize(video_path) / 1024 / 1024
+        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
         
         if video_size_mb < 0.1:
-            raise Exception(f"Downloaded video too small: {video_size_mb:.2f}MB")
+            # File vuoto - prova a vedere cosa c'è nella directory temp
+            temp_dir = os.path.dirname(video_path)
+            temp_files = os.listdir(temp_dir)
+            print(f"   Temp directory content: {temp_files[:10]}", flush=True)
+            
+            raise Exception(
+                f"Downloaded video too small ({video_size_mb:.3f}MB). "
+                f"Video potrebbe essere privato, geo-bloccato o con age restriction. "
+                f"URL: {video_url}"
+            )
         
         print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
+
         
         # STEP 2: Analizza durata video
         print("⏱️ Step 2/5: Analyzing video duration...", flush=True)
