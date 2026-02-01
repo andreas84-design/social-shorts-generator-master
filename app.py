@@ -2,385 +2,421 @@ import os
 import tempfile
 import subprocess
 import uuid
-import datetime as dt
 import json
+import traceback
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import boto3
 from botocore.config import Config
+from openai import OpenAI
+from google.cloud import texttospeech
+from google.oauth2 import service_account
+import gspread
 
 app = Flask(__name__)
 
-# Config R2
+# ==================== CONFIG ====================
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
-R2_REGION = os.environ.get("R2_REGION", "auto")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-yourdomain.r2.dev")
 
-# Config rotazione
-MAX_CLIPS_RETENTION = int(os.environ.get("MAX_CLIPS_RETENTION", "200"))
-RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "7"))
+# OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_s3_client():
-    """Client S3 per Cloudflare R2"""
-    endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    session = boto3.session.Session()
-    return session.client(
-        service_name="s3",
-        region_name=R2_REGION,
-        endpoint_url=endpoint_url,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(s3={"addressing_style": "virtual"}),
+# Google TTS client
+credentials = service_account.Credentials.from_service_account_info(
+    json.loads(GOOGLE_CREDENTIALS_JSON)
+)
+tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+
+# Google Sheets client
+gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
+
+# R2 client
+r2_client = boto3.client(
+    's3',
+    endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(signature_version='s3v4'),
+    region_name='auto'
+)
+
+# ==================== HELPER FUNCTIONS ====================
+
+def generate_scripts(video_title, channel_name):
+    """GPT-4 genera 4 script virali per short, ognuno ottimizzato per una piattaforma"""
+    
+    prompt = f"""Sei un esperto di contenuti virali per social media.
+
+Titolo video YouTube: "{video_title}"
+Canale: {channel_name}
+
+Genera 4 SCRIPT DIVERSI per short verticali (max 45 secondi). Ogni script DEVE essere ottimizzato per una piattaforma specifica:
+
+1. YOUTUBE SHORTS - Focus su retention e watch time
+2. TIKTOK - Hook ultra forte, trend-friendly
+3. INSTAGRAM REELS - Estetica curata, caption engaging
+4. FACEBOOK REELS - Più descrittivo, audience più ampia
+
+Ogni script deve avere questa struttura:
+- HOOK (3 sec) - Frase d'impatto che cattura subito
+- PROBLEMA (10 sec) - Identifica il pain point
+- SOLUZIONE (25 sec) - Contenuto di valore, 2-3 punti chiave
+- CTA (7 sec) - "Guarda il video completo su YouTube per saperne di più"
+
+REGOLE:
+- Script in ITALIANO
+- Linguaggio diretto e conversazionale
+- Ogni script UNICO (angolo diverso dello stesso tema)
+- Usa numeri e liste (es: "3 segnali di...", "Il metodo in 2 step...")
+- Max 120 parole per script
+- Adatta tono e stile alla piattaforma target
+
+Ritorna JSON:
+{{
+  "shorts": [
+    {{
+      "platform": "YouTube Shorts",
+      "script": "testo completo script",
+      "hook": "frase hook",
+      "title": "titolo short (max 50 caratteri)",
+      "caption": "descrizione ottimizzata per la piattaforma (max 150 caratteri)",
+      "hashtags": ["hashtag1", "hashtag2", "hashtag3", "hashtag4", "hashtag5"]
+    }},
+    // ... altri 3 per TikTok, Instagram, Facebook
+  ]
+}}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.8
     )
+    
+    return json.loads(response.choices[0].message.content)
 
-def cleanup_old_clips(s3_client):
-    """Rotazione clip R2"""
-    try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="social-clips/")
-        
-        all_clips = []
-        for page in pages:
-            if "Contents" not in page:
-                continue
-            for obj in page["Contents"]:
-                if obj["Key"].endswith(".mp4"):
-                    all_clips.append({
-                        "Key": obj["Key"],
-                        "LastModified": obj["LastModified"]
-                    })
-        
-        if not all_clips:
-            print("✅ Nessuna clip da pulire", flush=True)
-            return
-        
-        all_clips.sort(key=lambda x: x["LastModified"])
-        
-        now = dt.datetime.now(dt.timezone.utc)
-        retention_cutoff = now - dt.timedelta(days=RETENTION_DAYS)
-        deleted_count = 0
-        
-        for clip in all_clips:
-            if clip["LastModified"] < retention_cutoff:
-                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clip["Key"])
-                deleted_count += 1
-                print(f"🗑️ Cancellato (>{RETENTION_DAYS}gg): {clip['Key']}", flush=True)
-        
-        remaining_clips = [c for c in all_clips if c["LastModified"] >= retention_cutoff]
-        if len(remaining_clips) > MAX_CLIPS_RETENTION:
-            to_delete = remaining_clips[:len(remaining_clips) - MAX_CLIPS_RETENTION]
-            for clip in to_delete:
-                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=clip["Key"])
-                deleted_count += 1
-                print(f"🗑️ Cancellato (max limit): {clip['Key']}", flush=True)
-        
-        if deleted_count > 0:
-            print(f"✅ Rotazione completata: {deleted_count} clip cancellate", flush=True)
-        else:
-            print("✅ Nessuna clip da cancellare", flush=True)
-            
-    except Exception as e:
-        print(f"⚠️ Errore rotazione R2: {str(e)}", flush=True)
 
-def get_video_duration(video_path):
-    """Ottiene durata video in secondi"""
-    try:
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video file not found: {video_path}")
+def text_to_speech(text, output_path):
+    """Converte testo in audio MP3 con Google TTS Neural"""
+    
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="it-IT",
+        name="it-IT-Neural2-A",
+        ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+    )
+    
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=1.05,
+        pitch=0.0
+    )
+    
+    response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
+    
+    with open(output_path, "wb") as out:
+        out.write(response.audio_content)
+    
+    return output_path
+
+
+def get_audio_duration(audio_path):
+    """Ottiene durata audio in secondi"""
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        audio_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return float(result.stdout.strip())
+
+
+def generate_subtitles(script, audio_duration):
+    """Genera file SRT con timing automatico"""
+    
+    words = script.split()
+    total_words = len(words)
+    time_per_word = audio_duration / total_words
+    
+    srt_content = []
+    current_time = 0
+    words_per_subtitle = 4
+    
+    for i in range(0, total_words, words_per_subtitle):
+        subtitle_words = words[i:i+words_per_subtitle]
+        subtitle_text = " ".join(subtitle_words)
         
-        file_size = os.path.getsize(video_path)
-        if file_size < 1024:
-            raise ValueError(f"Video file too small: {file_size} bytes")
+        start_time = current_time
+        end_time = current_time + (len(subtitle_words) * time_per_word)
         
-        print(f"   Analyzing video file: {file_size/1024/1024:.1f}MB", flush=True)
+        srt_content.append(f"{len(srt_content) + 1}")
+        srt_content.append(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}")
+        srt_content.append(subtitle_text.upper())
+        srt_content.append("")
         
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            video_path
+        current_time = end_time
+    
+    return "\n".join(srt_content)
+
+
+def format_srt_time(seconds):
+    """Formatta secondi in formato SRT"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def create_video(audio_path, srt_path, output_path, title, cta_text):
+    """Genera video 9:16 con sottotitoli e CTA usando FFmpeg"""
+    
+    duration = get_audio_duration(audio_path)
+    
+    # Escape caratteri speciali per FFmpeg
+    srt_path_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
+    cta_escaped = cta_text.replace("'", "'\\\\\\''")
+    
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'lavfi', '-i', f'color=c=#1a1a2e:s=1080x1920:d={duration}',
+        '-i', audio_path,
+        '-vf',
+        f"subtitles={srt_path_escaped}:force_style='FontName=Arial Bold,FontSize=48,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=3,Bold=1,Alignment=2,MarginV=120',"
+        f"drawtext=text='{cta_escaped}':fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=36:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=10:x=(w-text_w)/2:y=h-150:enable='gte(t,{duration-5})'",
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-shortest',
+        output_path
+    ]
+    
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+def upload_to_r2(file_path, object_name):
+    """Upload file su Cloudflare R2"""
+    
+    r2_client.upload_file(
+        file_path,
+        R2_BUCKET_NAME,
+        object_name,
+        ExtraArgs={'ContentType': 'video/mp4'}
+    )
+    
+    url = f"{R2_PUBLIC_URL}/{object_name}"
+    return url
+
+
+def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, shorts_data):
+    """Scrive 4 short nel Calendario_Social e aggiorna Video_Master"""
+    
+    sheet = gc.open_by_key(sheet_id)
+    
+    # Leggi SOCIAL_SCHEDULE_TEMPLATE
+    schedule_ws = sheet.worksheet("SOCIAL_SCHEDULE_TEMPLATE")
+    schedule_data = schedule_ws.get_all_records()
+    
+    # Mappa giorni → numero
+    days_map = {
+        "Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
+        "Friday": 4, "Saturday": 5, "Sunday": 6
+    }
+    
+    # Trova quale slot usare (rotazione Day 1-4 basata su conteggio video)
+    video_master_ws = sheet.worksheet("Video_Master")
+    all_videos = video_master_ws.get_all_records()
+    video_count = len([v for v in all_videos if v.get('Status_Social') in ['SOCIAL_PROCESSED', 'PROCESSING']])
+    day_slot = (video_count % 4) + 1  # Rotazione 1,2,3,4
+    
+    day_col = f"Day {day_slot}"
+    time_col = f"Time {day_slot}"
+    
+    # Scrivi nel Calendario_Social
+    calendario_ws = sheet.worksheet("Calendario_Social")
+    
+    platform_map = {
+        "YouTube Shorts": "YT_Shorts",
+        "TikTok": "TikTok",
+        "Instagram Reels": "IG_Reels",
+        "Facebook Reels": "FB_Reels"
+    }
+    
+    for i, short in enumerate(shorts_data):
+        if i >= len(schedule_data):
+            break
+        
+        platform_schedule = schedule_data[i]
+        platform = platform_map.get(short["platform"], platform_schedule["Platform"])
+        day_name = platform_schedule.get(day_col, "Monday")
+        time_str = platform_schedule.get(time_col, "12:00")
+        
+        # Calcola prossima occorrenza
+        publish_date = get_next_weekday(day_name, days_map)
+        publish_datetime = f"{publish_date.strftime('%Y-%m-%d')} {time_str}"
+        
+        row = [
+            video_id,
+            channel_name,
+            i + 1,
+            platform,
+            short["video_url"],
+            short["title"],
+            short["caption"],
+            ", ".join(short["hashtags"]),
+            youtube_url,
+            publish_datetime,
+            "Scheduled"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-        
-        data = json.loads(result.stdout)
-        
-        if 'format' in data and 'duration' in data['format']:
-            duration = float(data['format']['duration'])
-            if duration > 0:
-                return duration
-        
-        if 'streams' in data:
-            for stream in data['streams']:
-                if stream.get('codec_type') == 'video' and 'duration' in stream:
-                    duration = float(stream['duration'])
-                    if duration > 0:
-                        return duration
-        
-        raise ValueError("Duration not found in video metadata")
-        
-    except Exception as e:
-        raise Exception(f"Failed to get video duration: {str(e)}")
+        calendario_ws.append_row(row)
+    
+    # Aggiorna Video_Master
+    cell = video_master_ws.find(video_id)
+    if cell:
+        row_num = cell.row
+        # Assume colonna F = Status_Social, G = Social_Processed_Date
+        video_master_ws.update_cell(row_num, 6, "SOCIAL_PROCESSED")
+        video_master_ws.update_cell(row_num, 7, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "healthy", "service": "social-shorts-generator"})
 
-@app.route("/debug", methods=["GET"])
-def debug():
-    """Endpoint debug per verificare tools installati"""
-    debug_info = {}
+def get_next_weekday(day_name, days_map):
+    """Calcola prossima occorrenza di un giorno della settimana"""
+    today = datetime.now()
+    target_day = days_map.get(day_name, 0)
+    current_day = today.weekday()
     
-    # Test yt-dlp
-    try:
-        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
-        debug_info["yt-dlp_version"] = result.stdout.strip()
-        debug_info["yt-dlp_installed"] = True
-    except Exception as e:
-        debug_info["yt-dlp_error"] = str(e)
-        debug_info["yt-dlp_installed"] = False
+    days_ahead = target_day - current_day
+    if days_ahead <= 0:
+        days_ahead += 7
     
-    # Test ffmpeg
-    try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
-        debug_info["ffmpeg_version"] = result.stdout.split('\n')[0]
-        debug_info["ffmpeg_installed"] = True
-    except Exception as e:
-        debug_info["ffmpeg_error"] = str(e)
-        debug_info["ffmpeg_installed"] = False
-    
-    # Test ffprobe
-    try:
-        result = subprocess.run(["ffprobe", "-version"], capture_output=True, text=True, timeout=5)
-        debug_info["ffprobe_version"] = result.stdout.split('\n')[0]
-        debug_info["ffprobe_installed"] = True
-    except Exception as e:
-        debug_info["ffprobe_error"] = str(e)
-        debug_info["ffprobe_installed"] = False
-    
-    # Test download semplice
-    try:
-        result = subprocess.run([
-            "yt-dlp",
-            "--print", "title",
-            "--verbose",
-            "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-        ], capture_output=True, text=True, timeout=30)
-        
-        debug_info["test_download"] = {
-            "success": result.returncode == 0,
-            "title": result.stdout.strip()[:100],
-            "stderr_preview": result.stderr[-500:] if result.stderr else None
-        }
-    except Exception as e:
-        debug_info["test_download"] = {
-            "success": False,
-            "error": str(e)
-        }
-    
-    return jsonify(debug_info)
+    return today + timedelta(days=days_ahead)
 
-@app.route("/process-social-video", methods=["POST"])
-def process_social_video():
-    """Processa video YouTube per Agente Social"""
-    video_path = None
-    clip_paths = []
+
+# ==================== API ENDPOINT ====================
+
+@app.route('/generate-shorts', methods=['POST'])
+def generate_shorts():
+    """
+    Endpoint principale per generare 4 short da video YouTube
+    
+    Input JSON:
+    {
+        "video_id": "unique_id",
+        "video_title": "Titolo video YouTube",
+        "youtube_url": "https://youtube.com/watch?v=...",
+        "channel_name": "Nome Canale",
+        "sheet_id": "Google Sheet ID"
+    }
+    """
+    
+    temp_files = []
     
     try:
-        data = request.get_json(force=True) or {}
-        video_url = data.get("video_url")
-        video_id = data.get("video_id", "unknown")
-        canale_id = data.get("canale_id", "unknown")
+        data = request.json
+        video_id = data.get("video_id")
+        video_title = data.get("video_title")
+        youtube_url = data.get("youtube_url")
+        channel_name = data.get("channel_name")
+        sheet_id = data.get("sheet_id")
         
-        if not video_url:
-            return jsonify({"success": False, "error": "video_url required"}), 400
+        if not all([video_id, video_title, youtube_url, channel_name, sheet_id]):
+            return jsonify({"success": False, "error": "Missing required fields"}), 400
         
-        print("=" * 80, flush=True)
-        print(f"🎬 AGENTE SOCIAL START", flush=True)
-        print(f"📹 Video: {video_url}", flush=True)
-        print(f"🆔 ID: {video_id} | Canale: {canale_id}", flush=True)
+        print(f"[INFO] Generazione short per: {video_title}")
         
-        # STEP 1: Download video
-        print("📥 Step 1/5: Downloading video...", flush=True)
-        video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        video_path = video_tmp.name
-        video_tmp.close()
+        # STEP 1: Genera 4 script con GPT-4
+        print("[INFO] Generazione script con GPT-4...")
+        scripts_data = generate_scripts(video_title, channel_name)
+        shorts_data = scripts_data["shorts"]
         
-        print(f"   Temp file: {video_path}", flush=True)
+        results = []
         
-        # yt-dlp con force overwrites e no-continue
-        download_result = subprocess.run([
-            "yt-dlp",
-            "-f", "best[height<=1080]",
-            "-o", video_path,
-            "--no-playlist",
-            "--force-overwrites",
-            "--no-continue",
-            video_url
-        ], timeout=300, capture_output=True, text=True, check=False)
-        
-        print(f"   yt-dlp exit code: {download_result.returncode}", flush=True)
-        
-        # Log stdout se presente
-        if download_result.stdout:
-            stdout_lines = [l for l in download_result.stdout.split('\n') if l.strip()][-10:]
-            if stdout_lines:
-                print("   yt-dlp output (last 10 lines):", flush=True)
-                for line in stdout_lines:
-                    print(f"     {line}", flush=True)
-        
-        # Log stderr se presente
-        if download_result.stderr:
-            stderr_lines = [l for l in download_result.stderr.split('\n') if l.strip()][-10:]
-            if stderr_lines:
-                print("   yt-dlp errors (last 10 lines):", flush=True)
-                for line in stderr_lines:
-                    print(f"     {line}", flush=True)
-        
-        if download_result.returncode != 0:
-            raise Exception(f"yt-dlp failed with exit code {download_result.returncode}")
-        
-        # Verifica file
-        print(f"   Checking file...", flush=True)
-        print(f"   File exists: {os.path.exists(video_path)}", flush=True)
-        
-        if not os.path.exists(video_path):
-            raise Exception("Video file not created by yt-dlp")
-        
-        video_size_mb = os.path.getsize(video_path) / 1024 / 1024
-        print(f"   File size: {video_size_mb:.3f}MB", flush=True)
-        
-        if video_size_mb < 0.5:
-            raise Exception(
-                f"Downloaded video too small: {video_size_mb:.3f}MB. "
-                f"Video might be unavailable, geo-restricted, or require authentication."
-            )
-        
-        print(f"✅ Video downloaded: {video_size_mb:.1f}MB", flush=True)
-    
-        # STEP 2: Analizza durata video
-        print("⏱️ Step 2/5: Analyzing duration...", flush=True)
-        total_duration = get_video_duration(video_path)
-        print(f"✅ Duration: {total_duration:.1f}s ({total_duration/60:.1f} min)", flush=True)
-        
-        # Verifica durata minima
-        min_duration = 180
-        if total_duration < min_duration:
-            return jsonify({
-                "success": False,
-                "error": f"Video troppo corto ({total_duration:.0f}s). Serve almeno {min_duration}s (3 min)."
-            }), 400
-        
-        # STEP 3: Calcola timestamp dinamici
-        print("📍 Step 3/5: Calculating timestamps...", flush=True)
-        clip_duration = 45
-        safety_margin = 60
-        usable_duration = total_duration - safety_margin - clip_duration
-        
-        clips_moments = []
-        captions = ["Hook iniziale", "Momento chiave", "Valore centrale", "CTA finale"]
-        
-        for i in range(4):
-            start_seconds = int((usable_duration / 5) * (i + 1))
-            clips_moments.append({
-                "start": start_seconds,
-                "duration": clip_duration,
-                "caption": captions[i]
-            })
-        
-        timestamps_str = ', '.join([str(c['start']) + 's' for c in clips_moments])
-        print(f"   Timestamps: {timestamps_str}", flush=True)
-        
-        # STEP 4: Taglia clip verticali + upload R2
-        print("✂️ Step 4/5: Cutting & uploading clips...", flush=True)
-        s3_client = get_s3_client()
-        today = dt.datetime.utcnow().strftime("%Y-%m-%d")
-        clips_data = []
-        
-        for i, moment in enumerate(clips_moments, 1):
-            clip_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            clip_path = clip_tmp.name
-            clip_tmp.close()
+        # STEP 2: Per ogni script genera short completo
+        for idx, short in enumerate(shorts_data, 1):
+            print(f"[INFO] Generazione short {idx}/4 per {short['platform']}...")
             
-            # Taglia clip verticale 1080x1920 (9:16)
-            print(f"   Cutting clip {i}/4 (start: {moment['start']}s, duration: {moment['duration']}s)...", flush=True)
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", str(moment["start"]),
-                "-i", video_path,
-                "-t", str(moment["duration"]),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                clip_path
-            ], check=True, timeout=120)
+            script = short["script"]
             
-            # Verifica clip creata
-            if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
-                raise Exception(f"Failed to create clip {i}")
+            # TTS
+            audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
+            temp_files.append(audio_path)
+            text_to_speech(script, audio_path)
+            
+            # Duration
+            audio_duration = get_audio_duration(audio_path)
+            
+            # SRT
+            srt_content = generate_subtitles(script, audio_duration)
+            srt_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.srt")
+            temp_files.append(srt_path)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+            
+            # Video
+            video_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
+            temp_files.append(video_path)
+            cta_text = "Video completo su YouTube ▶"
+            create_video(audio_path, srt_path, video_path, short["title"], cta_text)
             
             # Upload R2
-            print(f"   Uploading clip {i}/4 to R2...", flush=True)
-            object_key = f"social-clips/{today}/{canale_id}/{video_id}_clip{i}_{uuid.uuid4().hex[:8]}.mp4"
-            s3_client.upload_file(
-                Filename=clip_path,
-                Bucket=R2_BUCKET_NAME,
-                Key=object_key,
-                ExtraArgs={"ContentType": "video/mp4"}
-            )
+            r2_object_name = f"shorts/{channel_name}/{video_id}_short{idx}.mp4"
+            video_url = upload_to_r2(video_path, r2_object_name)
             
-            public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
-            clips_data.append({
-                "clip_number": i,
-                "storage_url": public_url,
-                "duration": f"00:00:{moment['duration']}",
-                "caption": moment["caption"],
-                "start_time": f"00:{moment['start']//60:02d}:{moment['start']%60:02d}"
+            results.append({
+                "platform": short["platform"],
+                "video_url": video_url,
+                "title": short["title"],
+                "caption": short["caption"],
+                "hashtags": short["hashtags"]
             })
-            
-            clip_paths.append(clip_path)
-            clip_size = os.path.getsize(clip_path) / 1024 / 1024
-            print(f"   ✅ Clip {i}/4: {clip_size:.1f}MB → R2", flush=True)
         
-        # STEP 5: Rotazione clip vecchie
-        print("🗑️ Step 5/5: Cleaning old clips...", flush=True)
-        cleanup_old_clips(s3_client)
+        # STEP 3: Scrivi su Google Sheets
+        print("[INFO] Scrittura su Google Sheets...")
+        write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results)
         
-        print(f"✅ AGENTE SOCIAL COMPLETED: 4 clips generated!", flush=True)
-        print("=" * 80, flush=True)
+        # Cleanup
+        for path in temp_files:
+            if os.path.exists(path):
+                os.unlink(path)
+        
+        print(f"[SUCCESS] 4 short generati con successo!")
         
         return jsonify({
             "success": True,
-            "video_id": video_id,
-            "canale_id": canale_id,
-            "video_duration": total_duration,
-            "clips": clips_data,
-            "clips_count": len(clips_data)
-        })
-    
-    except subprocess.TimeoutExpired as e:
-        print(f"❌ TIMEOUT ERROR: {e}", flush=True)
-        return jsonify({"success": False, "error": f"Processing timeout: {str(e)}"}), 500
-    except subprocess.CalledProcessError as e:
-        print(f"❌ COMMAND ERROR: {e}", flush=True)
-        return jsonify({"success": False, "error": f"Command failed: {str(e)}"}), 500
+            "shorts": results,
+            "message": "4 short generati e scritti su Google Sheets"
+        }), 200
+        
     except Exception as e:
-        print(f"❌ GENERAL ERROR: {e}", flush=True)
-        import traceback
+        print(f"[ERROR] {str(e)}")
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-    
-    finally:
-        # Cleanup file temporanei
-        for path in [video_path] + clip_paths:
+        
+        for path in temp_files:
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
-                except Exception as e:
-                    print(f"⚠️ Cleanup warning: {e}", flush=True)
+                except:
+                    pass
+        
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
