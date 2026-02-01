@@ -1,5 +1,6 @@
 flask==3.0.0
-gunicorn==21.2.0
-requests==2.31.0
-boto3==1.34.0
-yt-dlp
+openai==1.12.0
+google-cloud-texttospeech==2.16.0
+gspread==6.0.0
+google-auth==2.27.0
+boto3==1.34.34
