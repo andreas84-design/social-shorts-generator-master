@@ -4,7 +4,7 @@ import json
 import gspread
 from google.cloud import texttospeech
 from google.oauth2 import service_account
-import openai
+from openai import OpenAI
 from moviepy.editor import (
     VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip,
     concatenate_videoclips, ImageClip
@@ -24,7 +24,6 @@ app = Flask(__name__)
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-openai.api_key = OPENAI_API_KEY
 
 # Google Credentials
 GOOGLE_CREDENTIALS = json.loads(os.environ.get('GOOGLE_CREDENTIALS_JSON', '{}'))
@@ -78,7 +77,10 @@ Lo script deve:
 Fornisci SOLO il testo dello script, senza titoli o etichette."""
 
     try:
-        response = openai.ChatCompletion.create(
+        # Inizializza client OpenAI 1.x
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "Sei un esperto copywriter per social media."},
@@ -94,6 +96,7 @@ Fornisci SOLO il testo dello script, senza titoli o etichette."""
         
     except Exception as e:
         print(f"[ERROR] Errore generazione script GPT-4: {e}")
+        traceback.print_exc()
         raise
 
 
@@ -132,6 +135,7 @@ def text_to_speech(text, output_path):
         
     except Exception as e:
         print(f"[ERROR] Errore Google TTS: {e}")
+        traceback.print_exc()
         raise
 
 
@@ -146,14 +150,14 @@ def create_short_video(script, audio_path, output_path, platform):
         width, height = 1080, 1920
         duration_audio = AudioFileClip(audio_path).duration
         
-        # Crea sfondo colorato
+        # Crea sfondo colorato con gradiente
         from PIL import Image, ImageDraw
         import numpy as np
         
         img = Image.new('RGB', (width, height), color=(30, 30, 50))
         draw = ImageDraw.Draw(img)
         
-        # Aggiungi gradiente
+        # Aggiungi gradiente verticale
         for y in range(height):
             r = int(30 + (y / height) * 40)
             g = int(30 + (y / height) * 50)
@@ -218,7 +222,11 @@ def upload_to_r2(file_path, channel_name, platform):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         
-        s3_key = f"shorts/{channel_name}/{platform}_{timestamp}_{unique_id}.mp4"
+        # Sanitizza nome canale per path
+        channel_safe = channel_name.replace(" ", "_").replace("/", "_")
+        platform_safe = platform.replace(" ", "_")
+        
+        s3_key = f"shorts/{channel_safe}/{platform_safe}_{timestamp}_{unique_id}.mp4"
         
         s3_client.upload_file(
             file_path,
@@ -234,6 +242,7 @@ def upload_to_r2(file_path, channel_name, platform):
         
     except Exception as e:
         print(f"[ERROR] Errore upload R2: {e}")
+        traceback.print_exc()
         raise
 
 
@@ -244,17 +253,17 @@ def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results):
     print(f"[INFO] Scrittura su Google Sheets...")
     
     try:
-        # FIX 1: Strip spazi da sheet_id
+        # Strip spazi da sheet_id
         sheet_id = sheet_id.strip()
         
-        # FIX 2: Log per debug
+        # Log per debug
         print(f"[DEBUG] Sheet ID ricevuto: '{sheet_id}'")
         print(f"[DEBUG] Lunghezza Sheet ID: {len(sheet_id)}")
         
         # Inizializza client gspread
         gc = gspread.service_account_from_dict(GOOGLE_CREDENTIALS)
         
-        # FIX 3: Prova ad aprire lo sheet
+        # Prova ad aprire lo sheet
         print(f"[DEBUG] Tentativo apertura Sheet...")
         spreadsheet = gc.open_by_key(sheet_id)
         print(f"[SUCCESS] Sheet aperto: {spreadsheet.title}")
@@ -262,6 +271,7 @@ def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results):
         # Apri worksheet "Calendario_Social"
         try:
             worksheet = spreadsheet.worksheet("Calendario_Social")
+            print(f"[INFO] Worksheet 'Calendario_Social' trovato")
         except gspread.exceptions.WorksheetNotFound:
             print("[WARNING] Worksheet 'Calendario_Social' non trovato, lo creo...")
             worksheet = spreadsheet.add_worksheet(title="Calendario_Social", rows=1000, cols=20)
@@ -283,6 +293,7 @@ def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results):
         }
         
         # Scrivi righe per ogni piattaforma
+        rows_added = 0
         for result in results:
             platform = result['platform']
             pub_date, pub_time = platforms_schedule[platform]
@@ -293,21 +304,23 @@ def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results):
                 platform,
                 result['video_url'],
                 result['script'][:500],  # Limita lunghezza
-                f"Guarda il video completo! {youtube_url}",
-                "#shorts #viral #tutorial",
+                f"Guarda il video completo su YouTube! 👉 {youtube_url}",
+                "#shorts #viral #tutorial #italia",
                 pub_date.strftime("%Y-%m-%d"),
                 pub_time,
                 "Scheduled"
             ]
             
             worksheet.append_row(row_data)
-            print(f"[INFO] Riga aggiunta per {platform}")
+            rows_added += 1
+            print(f"[INFO] Riga {rows_added}/4 aggiunta per {platform}")
         
-        print(f"[SUCCESS] {len(results)} righe scritte su Google Sheets")
+        print(f"[SUCCESS] {rows_added} righe scritte su Google Sheets con successo!")
         
     except gspread.exceptions.SpreadsheetNotFound as e:
-        print(f"[ERROR] Sheet non trovato! ID: {sheet_id}")
-        print(f"[ERROR] Dettaglio: {e}")
+        print(f"[ERROR] Sheet non trovato! ID: '{sheet_id}'")
+        print(f"[ERROR] Assicurati che lo Sheet esista e che il Service Account abbia accesso")
+        print(f"[ERROR] Service Account email: {GOOGLE_CREDENTIALS.get('client_email', 'N/A')}")
         raise
     except Exception as e:
         print(f"[ERROR] Errore scrittura Google Sheets: {e}")
@@ -340,14 +353,25 @@ def generate_shorts():
         
         # Validazione
         if not all([video_id, video_title, youtube_url, channel_name, sheet_id]):
+            missing = []
+            if not video_id: missing.append('video_id')
+            if not video_title: missing.append('video_title')
+            if not youtube_url: missing.append('youtube_url')
+            if not channel_name: missing.append('channel_name')
+            if not sheet_id: missing.append('sheet_id')
+            
             return jsonify({
-                "error": "Parametri mancanti",
+                "error": f"Parametri mancanti: {', '.join(missing)}",
                 "success": False
             }), 400
         
-        print(f"[INFO] Generazione short per: {video_title}")
+        print(f"\n{'='*60}")
+        print(f"[INFO] INIZIO GENERAZIONE SHORT")
+        print(f"[INFO] Video: {video_title}")
         print(f"[INFO] Channel: {channel_name}")
+        print(f"[INFO] Video ID: {video_id}")
         print(f"[INFO] Sheet ID: {sheet_id}")
+        print(f"{'='*60}\n")
         
         # Piattaforme target
         platforms = ["YouTube Shorts", "TikTok", "Instagram Reels", "Facebook Reels"]
@@ -355,49 +379,73 @@ def generate_shorts():
         
         # Genera short per ogni piattaforma
         for i, platform in enumerate(platforms, 1):
-            print(f"[INFO] Generazione short {i}/4 per {platform}...")
+            print(f"\n[INFO] === Generazione short {i}/4 per {platform} ===")
             
-            # 1. Genera script
-            script = generate_script_with_gpt4(video_title, platform)
-            
-            # 2. Crea audio
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
-                audio_path = audio_file.name
-            
-            text_to_speech(script, audio_path)
-            
-            # 3. Crea video
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
-                video_path = video_file.name
-            
-            create_short_video(script, audio_path, video_path, platform)
-            
-            # 4. Upload su R2
-            video_url = upload_to_r2(video_path, channel_name, platform)
-            
-            # 5. Cleanup temp files
-            os.unlink(audio_path)
-            os.unlink(video_path)
-            
-            results.append({
-                "platform": platform,
-                "script": script,
-                "video_url": video_url
-            })
-            
-            print(f"[SUCCESS] Short {i}/4 completato per {platform}")
+            try:
+                # 1. Genera script
+                script = generate_script_with_gpt4(video_title, platform)
+                
+                # 2. Crea audio
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
+                    audio_path = audio_file.name
+                
+                text_to_speech(script, audio_path)
+                
+                # 3. Crea video
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
+                    video_path = video_file.name
+                
+                create_short_video(script, audio_path, video_path, platform)
+                
+                # 4. Upload su R2
+                video_url = upload_to_r2(video_path, channel_name, platform)
+                
+                # 5. Cleanup temp files
+                try:
+                    os.unlink(audio_path)
+                    os.unlink(video_path)
+                except:
+                    pass
+                
+                results.append({
+                    "platform": platform,
+                    "script": script,
+                    "video_url": video_url
+                })
+                
+                print(f"[SUCCESS] ✅ Short {i}/4 completato per {platform}\n")
+                
+            except Exception as e:
+                print(f"[ERROR] ❌ Errore generazione short per {platform}: {e}")
+                # Continua con le altre piattaforme
+                continue
+        
+        # Verifica che almeno un short sia stato generato
+        if not results:
+            return jsonify({
+                "error": "Nessuno short generato con successo",
+                "success": False
+            }), 500
         
         # Scrivi su Google Sheets
+        print(f"\n[INFO] === Scrittura risultati su Google Sheets ===")
         write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results)
+        
+        print(f"\n{'='*60}")
+        print(f"[SUCCESS] 🎉 PROCESSO COMPLETATO!")
+        print(f"[SUCCESS] {len(results)}/{len(platforms)} short generati con successo")
+        print(f"{'='*60}\n")
         
         return jsonify({
             "success": True,
             "message": f"{len(results)} short generati con successo",
+            "video_id": video_id,
+            "channel_name": channel_name,
             "results": results
         }), 200
         
     except Exception as e:
-        print(f"[ERROR] Errore generale: {e}")
+        print(f"\n[ERROR] ❌ ERRORE GENERALE: {e}")
         traceback.print_exc()
         return jsonify({
             "error": str(e),
@@ -409,4 +457,8 @@ def generate_shorts():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting Social Shorts Generator Backend")
+    print(f"📍 Port: {port}")
+    print(f"{'='*60}\n")
     app.run(host='0.0.0.0', port=port, debug=False)
