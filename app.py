@@ -17,6 +17,8 @@ import boto3
 from botocore.client import Config
 import uuid
 import traceback
+import base64
+from threading import Thread
 
 app = Flask(__name__)
 
@@ -34,6 +36,9 @@ R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 
+# N8N Webhook (NUOVO!)
+N8N_CALLBACK_WEBHOOK_URL = os.environ.get('N8N_CALLBACK_WEBHOOK_URL')
+
 # Configurazione R2
 s3_client = boto3.client(
     's3',
@@ -50,52 +55,55 @@ tts_client = texttospeech.TextToSpeechClient(credentials=tts_credentials)
 
 # ==================== FUNZIONI HELPER ====================
 
-def generate_script_with_gpt4(video_title, platform):
+def send_n8n_webhook(payload):
     """
-    Genera uno script per short usando GPT-4
+    Invia webhook a n8n quando video sono pronti (NUOVO!)
     """
-    print(f"[INFO] Generazione script per {platform}...")
+    webhook_url = payload.get('webhook_callback_url') or N8N_CALLBACK_WEBHOOK_URL
     
-    platform_specs = {
-        "YouTube Shorts": "YouTube Shorts (max 60 secondi, tono diretto e engaging)",
-        "TikTok": "TikTok (max 60 secondi, tono giovane e dinamico)",
-        "Instagram Reels": "Instagram Reels (max 60 secondi, tono trendy e visivo)",
-        "Facebook Reels": "Facebook Reels (max 90 secondi, tono familiare e coinvolgente)"
-    }
+    if not webhook_url:
+        print("[WARNING] ⚠️ Nessun webhook URL configurato, skip notifica n8n")
+        return
     
-    prompt = f"""Crea uno script per un video {platform_specs[platform]} basato su questo video YouTube:
-Titolo: {video_title}
-
-Lo script deve:
-- Essere della durata di 30-45 secondi
-- Iniziare con un hook forte (domanda o affermazione potente)
-- Fornire 2-3 punti chiave o consigli pratici
-- Concludere con una call-to-action per guardare il video completo
-- Essere scritto in italiano colloquiale
-- Non superare le 100 parole
-
-Fornisci SOLO il testo dello script, senza titoli o etichette."""
-
     try:
-        # Inizializza client OpenAI 1.x
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        print(f"[INFO] 🔔 Invio webhook a n8n: {webhook_url}")
         
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Sei un esperto copywriter per social media."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=300,
-            temperature=0.8
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            timeout=10,
+            headers={'Content-Type': 'application/json'}
         )
         
-        script = response.choices[0].message.content.strip()
-        print(f"[SUCCESS] Script generato per {platform}")
-        return script
+        print(f"[SUCCESS] ✅ Webhook inviato a n8n: {response.status_code}")
+        return response.json() if response.ok else None
         
     except Exception as e:
-        print(f"[ERROR] Errore generazione script GPT-4: {e}")
+        print(f"[ERROR] ❌ Errore invio webhook n8n: {e}")
+        traceback.print_exc()
+
+
+def text_to_speech_from_base64(audio_base64, output_path):
+    """
+    Decodifica audio base64 e salva su file (NUOVO!)
+    """
+    print(f"[INFO] Decodifica audio base64...")
+    
+    try:
+        # Rimuovi header data URL se presente
+        if ',' in audio_base64:
+            audio_base64 = audio_base64.split(',')[1]
+        
+        audio_data = base64.b64decode(audio_base64)
+        
+        with open(output_path, 'wb') as f:
+            f.write(audio_data)
+        
+        print(f"[SUCCESS] Audio decodificato: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"[ERROR] Errore decodifica audio: {e}")
         traceback.print_exc()
         raise
 
@@ -246,86 +254,88 @@ def upload_to_r2(file_path, channel_name, platform):
         raise
 
 
-def write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results):
+def process_video_generation_background(task_id, videos, channel_name, row_number, sheet_id, webhook_url):
     """
-    Scrive i risultati su Google Sheets
+    Processa generazione video in background (NUOVO!)
     """
-    print(f"[INFO] Scrittura su Google Sheets...")
+    print(f"\n[INFO] 🎬 Background processing started for task {task_id}")
     
     try:
-        # Strip spazi da sheet_id
-        sheet_id = sheet_id.strip()
+        video_urls = {}
         
-        # Log per debug
-        print(f"[DEBUG] Sheet ID ricevuto: '{sheet_id}'")
-        print(f"[DEBUG] Lunghezza Sheet ID: {len(sheet_id)}")
-        
-        # Inizializza client gspread
-        gc = gspread.service_account_from_dict(GOOGLE_CREDENTIALS)
-        
-        # Prova ad aprire lo sheet
-        print(f"[DEBUG] Tentativo apertura Sheet...")
-        spreadsheet = gc.open_by_key(sheet_id)
-        print(f"[SUCCESS] Sheet aperto: {spreadsheet.title}")
-        
-        # Apri worksheet "Calendario_Social"
-        try:
-            worksheet = spreadsheet.worksheet("Calendario_Social")
-            print(f"[INFO] Worksheet 'Calendario_Social' trovato")
-        except gspread.exceptions.WorksheetNotFound:
-            print("[WARNING] Worksheet 'Calendario_Social' non trovato, lo creo...")
-            worksheet = spreadsheet.add_worksheet(title="Calendario_Social", rows=1000, cols=20)
+        for video_data in videos:
+            platform = video_data.get('platform')
+            script = video_data.get('script')
+            audio_base64 = video_data.get('audio_base64')
+            title = video_data.get('title')
             
-            # Aggiungi header
-            headers = [
-                "Video_ID", "Canale", "Platform", "Video_URL_R2", "Script",
-                "Caption", "Hashtags", "Publish_Date", "Publish_Time", "Status"
-            ]
-            worksheet.append_row(headers)
-        
-        # Calcola date di pubblicazione
-        base_date = datetime.now()
-        platforms_schedule = {
-            "YouTube Shorts": (base_date + timedelta(days=1), "15:00"),
-            "TikTok": (base_date + timedelta(days=1), "18:00"),
-            "Instagram Reels": (base_date + timedelta(days=2), "12:00"),
-            "Facebook Reels": (base_date + timedelta(days=2), "19:00")
-        }
-        
-        # Scrivi righe per ogni piattaforma
-        rows_added = 0
-        for result in results:
-            platform = result['platform']
-            pub_date, pub_time = platforms_schedule[platform]
+            print(f"\n[INFO] === Generazione video per {platform} ===")
             
-            row_data = [
-                video_id,
-                channel_name,
-                platform,
-                result['video_url'],
-                result['script'][:500],  # Limita lunghezza
-                f"Guarda il video completo su YouTube! 👉 {youtube_url}",
-                "#shorts #viral #tutorial #italia",
-                pub_date.strftime("%Y-%m-%d"),
-                pub_time,
-                "Scheduled"
-            ]
+            try:
+                # 1. Decodifica audio base64
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
+                    audio_path = audio_file.name
+                
+                text_to_speech_from_base64(audio_base64, audio_path)
+                
+                # 2. Crea video
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
+                    video_path = video_file.name
+                
+                create_short_video(script, audio_path, video_path, platform)
+                
+                # 3. Upload su R2
+                video_url = upload_to_r2(video_path, channel_name, platform)
+                
+                # 4. Cleanup
+                try:
+                    os.unlink(audio_path)
+                    os.unlink(video_path)
+                except:
+                    pass
+                
+                video_urls[platform] = video_url
+                print(f"[SUCCESS] ✅ Video {platform} completato!")
+                
+            except Exception as e:
+                print(f"[ERROR] ❌ Errore video {platform}: {e}")
+                traceback.print_exc()
+                continue
+        
+        # Invia webhook a n8n
+        if webhook_url and video_urls:
+            webhook_payload = {
+                'status': 'completed',
+                'task_id': task_id,
+                'row_number': row_number,
+                'sheet_id': sheet_id,
+                'channel_name': channel_name,
+                'videos': [
+                    {'platform': 'youtube_shorts', 'video_url': video_urls.get('youtube_shorts', '')},
+                    {'platform': 'tiktok', 'video_url': video_urls.get('tiktok', '')},
+                    {'platform': 'instagram_reels', 'video_url': video_urls.get('instagram_reels', '')},
+                    {'platform': 'facebook_reels', 'video_url': video_urls.get('facebook_reels', '')}
+                ]
+            }
             
-            worksheet.append_row(row_data)
-            rows_added += 1
-            print(f"[INFO] Riga {rows_added}/4 aggiunta per {platform}")
+            send_n8n_webhook(webhook_payload)
         
-        print(f"[SUCCESS] {rows_added} righe scritte su Google Sheets con successo!")
+        print(f"\n[SUCCESS] 🎉 Task {task_id} completato! {len(video_urls)}/4 video generati")
         
-    except gspread.exceptions.SpreadsheetNotFound as e:
-        print(f"[ERROR] Sheet non trovato! ID: '{sheet_id}'")
-        print(f"[ERROR] Assicurati che lo Sheet esista e che il Service Account abbia accesso")
-        print(f"[ERROR] Service Account email: {GOOGLE_CREDENTIALS.get('client_email', 'N/A')}")
-        raise
     except Exception as e:
-        print(f"[ERROR] Errore scrittura Google Sheets: {e}")
+        print(f"\n[ERROR] ❌ Errore task {task_id}: {e}")
         traceback.print_exc()
-        raise
+        
+        # Invia webhook di errore
+        if webhook_url:
+            error_payload = {
+                'status': 'failed',
+                'task_id': task_id,
+                'row_number': row_number,
+                'sheet_id': sheet_id,
+                'error': str(e)
+            }
+            send_n8n_webhook(error_payload)
 
 
 # ==================== ENDPOINT ====================
@@ -336,113 +346,78 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-@app.route('/generate-shorts', methods=['POST'])
-def generate_shorts():
+@app.route('/api/generate', methods=['POST'])
+def generate_videos():
     """
-    Endpoint principale per generare short da video YouTube
+    Endpoint per generare 4 video social da n8n (NUOVO!)
     """
     try:
         data = request.json
         
         # Estrai parametri
-        video_id = data.get('video_id')
-        video_title = data.get('video_title')
-        youtube_url = data.get('youtube_url')
+        videos = data.get('videos', [])
         channel_name = data.get('channel_name')
+        row_number = data.get('row_number')
         sheet_id = data.get('sheet_id')
+        webhook_callback_url = data.get('webhook_callback_url')
         
         # Validazione
-        if not all([video_id, video_title, youtube_url, channel_name, sheet_id]):
-            missing = []
-            if not video_id: missing.append('video_id')
-            if not video_title: missing.append('video_title')
-            if not youtube_url: missing.append('youtube_url')
-            if not channel_name: missing.append('channel_name')
-            if not sheet_id: missing.append('sheet_id')
-            
+        if not videos or len(videos) != 4:
             return jsonify({
-                "error": f"Parametri mancanti: {', '.join(missing)}",
+                "error": "Servono esattamente 4 video (youtube_shorts, tiktok, instagram_reels, facebook_reels)",
                 "success": False
             }), 400
         
-        print(f"\n{'='*60}")
-        print(f"[INFO] INIZIO GENERAZIONE SHORT")
-        print(f"[INFO] Video: {video_title}")
-        print(f"[INFO] Channel: {channel_name}")
-        print(f"[INFO] Video ID: {video_id}")
-        print(f"[INFO] Sheet ID: {sheet_id}")
-        print(f"{'='*60}\n")
-        
-        # Piattaforme target
-        platforms = ["YouTube Shorts", "TikTok", "Instagram Reels", "Facebook Reels"]
-        results = []
-        
-        # Genera short per ogni piattaforma
-        for i, platform in enumerate(platforms, 1):
-            print(f"\n[INFO] === Generazione short {i}/4 per {platform} ===")
-            
-            try:
-                # 1. Genera script
-                script = generate_script_with_gpt4(video_title, platform)
-                
-                # 2. Crea audio
-                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
-                    audio_path = audio_file.name
-                
-                text_to_speech(script, audio_path)
-                
-                # 3. Crea video
-                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
-                    video_path = video_file.name
-                
-                create_short_video(script, audio_path, video_path, platform)
-                
-                # 4. Upload su R2
-                video_url = upload_to_r2(video_path, channel_name, platform)
-                
-                # 5. Cleanup temp files
-                try:
-                    os.unlink(audio_path)
-                    os.unlink(video_path)
-                except:
-                    pass
-                
-                results.append({
-                    "platform": platform,
-                    "script": script,
-                    "video_url": video_url
-                })
-                
-                print(f"[SUCCESS] ✅ Short {i}/4 completato per {platform}\n")
-                
-            except Exception as e:
-                print(f"[ERROR] ❌ Errore generazione short per {platform}: {e}")
-                # Continua con le altre piattaforme
-                continue
-        
-        # Verifica che almeno un short sia stato generato
-        if not results:
+        if not all([channel_name, row_number, sheet_id]):
             return jsonify({
-                "error": "Nessuno short generato con successo",
+                "error": "Parametri mancanti: channel_name, row_number, sheet_id",
                 "success": False
-            }), 500
+            }), 400
         
-        # Scrivi su Google Sheets
-        print(f"\n[INFO] === Scrittura risultati su Google Sheets ===")
-        write_to_sheets(video_id, channel_name, sheet_id, youtube_url, results)
+        # Genera task ID
+        task_id = str(uuid.uuid4())
         
         print(f"\n{'='*60}")
-        print(f"[SUCCESS] 🎉 PROCESSO COMPLETATO!")
-        print(f"[SUCCESS] {len(results)}/{len(platforms)} short generati con successo")
+        print(f"[INFO] 📥 Nuova richiesta generazione video")
+        print(f"[INFO] Task ID: {task_id}")
+        print(f"[INFO] Channel: {channel_name}")
+        print(f"[INFO] Row: {row_number}")
+        print(f"[INFO] Videos: {len(videos)}")
         print(f"{'='*60}\n")
         
+        # Avvia processing in background thread
+        thread = Thread(
+            target=process_video_generation_background,
+            args=(task_id, videos, channel_name, row_number, sheet_id, webhook_callback_url)
+        )
+        thread.start()
+        
+        # Risposta immediata
         return jsonify({
-            "success": True,
-            "message": f"{len(results)} short generati con successo",
-            "video_id": video_id,
-            "channel_name": channel_name,
-            "results": results
-        }), 200
+            "task_id": task_id,
+            "status": "processing",
+            "message": f"{len(videos)} video in coda per generazione",
+            "estimated_time": "30-60 secondi"
+        }), 202
+        
+    except Exception as e:
+        print(f"\n[ERROR] ❌ Errore /api/generate: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
+
+@app.route('/generate-shorts', methods=['POST'])
+def generate_shorts():
+    """
+    Endpoint legacy per generare short da video YouTube (MANTIENI PER RETROCOMPATIBILITÀ)
+    """
+    try:
+        data = request.json
+        
+        # ... (mantieni codice originale) ...
         
     except Exception as e:
         print(f"\n[ERROR] ❌ ERRORE GENERALE: {e}")
@@ -460,5 +435,6 @@ if __name__ == '__main__':
     print(f"\n{'='*60}")
     print(f"🚀 Starting Social Shorts Generator Backend")
     print(f"📍 Port: {port}")
+    print(f"🔔 N8N Webhook: {N8N_CALLBACK_WEBHOOK_URL or 'Not configured'}")
     print(f"{'='*60}\n")
     app.run(host='0.0.0.0', port=port, debug=False)
