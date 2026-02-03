@@ -13,6 +13,7 @@ import subprocess
 import math
 import random
 from threading import Thread
+import sys
 
 app = Flask(__name__)
 
@@ -47,16 +48,16 @@ def send_n8n_webhook(payload):
     webhook_url = payload.get('webhook_callback_url') or N8N_CALLBACK_WEBHOOK_URL
     
     if not webhook_url:
-        print("[WARNING] ⚠️ Nessun webhook URL configurato")
+        print("[WARNING] ⚠️ Nessun webhook URL configurato", flush=True)
         return
     
     try:
-        print(f"[INFO] 🔔 Invio webhook a n8n")
+        print(f"[INFO] 🔔 Invio webhook a n8n", flush=True)
         response = requests.post(webhook_url, json=payload, timeout=10, headers={'Content-Type': 'application/json'})
-        print(f"[SUCCESS] ✅ Webhook inviato: {response.status_code}")
+        print(f"[SUCCESS] ✅ Webhook inviato: {response.status_code}", flush=True)
         return response.json() if response.ok else None
     except Exception as e:
-        print(f"[ERROR] ❌ Errore webhook: {e}")
+        print(f"[ERROR] ❌ Errore webhook: {e}", flush=True)
 
 
 def extract_keywords_from_text(text, max_keywords=10):
@@ -64,7 +65,6 @@ def extract_keywords_from_text(text, max_keywords=10):
     if not text:
         return []
     
-    # Rimuovi parole comuni italiane/inglesi
     stopwords = {'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'una', 'di', 'da', 'a', 'in', 'per', 'con', 'su',
                  'come', 'che', 'si', 'non', 'del', 'della', 'dei', 'delle', 'sono', 'è', 'the', 'a', 'an',
                  'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as', 'is', 'was'}
@@ -72,43 +72,31 @@ def extract_keywords_from_text(text, max_keywords=10):
     words = text.lower().split()
     keywords = [w for w in words if len(w) > 3 and w not in stopwords and w.isalpha()]
     
-    # Conta frequenza
     from collections import Counter
     word_freq = Counter(keywords)
     
-    # Top keywords
     return [word for word, _ in word_freq.most_common(max_keywords)]
 
 
 def build_dynamic_query(video_title, keywords, description, script, scene_context=""):
-    """
-    Costruisce query dinamica per Pexels/Pixabay basata sui dati del video (GENERICO PER TUTTI I CANALI)
-    """
-    # Raccogli tutti i testi disponibili
+    """Costruisce query dinamica per Pexels/Pixabay"""
     all_text = f"{video_title} {keywords} {description} {script} {scene_context}"
-    
-    # Estrai keywords principali
     main_keywords = extract_keywords_from_text(all_text, max_keywords=5)
     
-    # Se abbiamo keywords dal sheet, usale prioritariamente
     if keywords and keywords.strip():
         sheet_keywords = [k.strip() for k in keywords.split(',')][:3]
         main_keywords = sheet_keywords + main_keywords
     
-    # Costruisci query
-    query_parts = main_keywords[:5]  # Max 5 keywords
+    query_parts = main_keywords[:5]
     query = " ".join(query_parts) if query_parts else "people activity lifestyle"
     
-    print(f"[INFO] 📝 Query dinamica: '{query}'")
+    print(f"[INFO] 📝 Query dinamica: '{query}'", flush=True)
     return query
 
 
 def is_video_relevant(video_data, source, banned_topics=None):
-    """
-    Filtro GENERICO: rimuove solo video bannati (es. animali, cibo se non pertinente)
-    """
+    """Filtro GENERICO"""
     if banned_topics is None:
-        # Banned topics generici (aggiungi qui topics da evitare SEMPRE)
         banned_topics = []
     
     if source == "pexels":
@@ -116,11 +104,10 @@ def is_video_relevant(video_data, source, banned_topics=None):
     else:
         text = " ".join(video_data.get("tags", [])).lower()
     
-    # Controlla se c'è qualcosa di bannato
     has_banned = any(topic in text for topic in banned_topics)
     
     if has_banned:
-        print(f"[WARNING] ⚠️ Video bannato: '{text[:60]}'")
+        print(f"[WARNING] ⚠️ Video bannato: '{text[:60]}'", flush=True)
         return False
     
     return True
@@ -139,7 +126,7 @@ def download_file(url: str) -> str:
 
 
 def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: float):
-    """Cerca e scarica clip da Pexels o Pixabay (GENERICO)"""
+    """Cerca e scarica clip da Pexels o Pixabay"""
     target_duration = min(4.0, avg_scene_duration)
     
     def try_pexels():
@@ -157,7 +144,7 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: floa
             return None
         videos = resp.json().get("videos", [])
         relevant_videos = [v for v in videos if is_video_relevant(v, "pexels")]
-        print(f"[INFO] 🎯 Pexels: {len(videos)} totali → {len(relevant_videos)} rilevanti")
+        print(f"[INFO] 🎯 Pexels scena {scene_number}: {len(videos)} totali → {len(relevant_videos)} rilevanti", flush=True)
         if relevant_videos:
             video = random.choice(relevant_videos)
             for vf in video.get("video_files", []):
@@ -187,16 +174,16 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: floa
                         return download_file(videos[quality]["url"])
         return None
     
-    # Prova Pexels, poi Pixabay
     for source_name, func in [("Pexels", try_pexels), ("Pixabay", try_pixabay)]:
         try:
             path = func()
             if path:
-                print(f"[INFO] 🎥 Scena {scene_number}: {source_name} ✓")
+                print(f"[INFO] 🎥 Scena {scene_number}: {source_name} ✓", flush=True)
                 return path, target_duration
         except Exception as e:
-            print(f"[WARNING] ⚠️ {source_name}: {e}")
+            print(f"[WARNING] ⚠️ {source_name} scena {scene_number}: {e}", flush=True)
     
+    print(f"[WARNING] ⚠️ NO CLIP per scena {scene_number}", flush=True)
     return None, None
 
 
@@ -205,35 +192,32 @@ def download_audio_from_url(audio_url, output_path):
     if not audio_url:
         raise ValueError("audio_url è None o vuoto")
     
-    print(f"[INFO] Processing audio...")
+    print(f"[INFO] Processing audio...", flush=True)
     
     try:
-        # Se è un data URL base64
         if audio_url.startswith('data:audio'):
-            print("[INFO] Decodifica audio base64...")
-            # Rimuovi header "data:audio/mpeg;base64,"
+            print("[INFO] Decodifica audio base64...", flush=True)
             base64_data = audio_url.split(',')[1] if ',' in audio_url else audio_url
             audio_bytes = base64.b64decode(base64_data)
             
             with open(output_path, 'wb') as f:
                 f.write(audio_bytes)
             
-            print(f"[SUCCESS] Audio decodificato ({len(audio_bytes)} bytes)")
+            print(f"[SUCCESS] Audio decodificato ({len(audio_bytes)} bytes)", flush=True)
             return output_path
         
-        # Altrimenti è un URL normale
-        print(f"[INFO] Download audio da URL: {audio_url[:80]}...")
+        print(f"[INFO] Download audio da URL", flush=True)
         response = requests.get(audio_url, timeout=30)
         response.raise_for_status()
         
         with open(output_path, 'wb') as f:
             f.write(response.content)
         
-        print(f"[SUCCESS] Audio scaricato")
+        print(f"[SUCCESS] Audio scaricato", flush=True)
         return output_path
         
     except Exception as e:
-        print(f"[ERROR] Errore audio: {e}")
+        print(f"[ERROR] Errore audio: {e}", flush=True)
         raise
 
 
@@ -247,36 +231,32 @@ def get_video_duration(path):
 
 
 def create_short_video_with_clips(video_data, audio_path, output_path, platform):
-    """
-    Crea video short 9:16 con 5 clip di background + audio (GENERICO PER TUTTI I CANALI)
-    """
-    print(f"[INFO] Creazione video {platform} con {MAX_CLIPS} clip...")
+    """Crea video short 9:16 con 5 clip"""
+    print(f"\n[INFO] 🎬 Creazione video {platform} con {MAX_CLIPS} clip...", flush=True)
     
     try:
-        # Estrai dati dal video_data
         script = video_data.get('script', '')
         video_title = video_data.get('video_title', '')
         keywords = video_data.get('keywords', '')
         description = video_data.get('description', '')
         
-        # 1. Ottieni durata audio
         audio_duration = get_video_duration(audio_path)
-        print(f"[INFO] Durata audio: {audio_duration:.1f}s")
-        print(f"[INFO] Video: '{video_title[:50]}'")
-        print(f"[INFO] Keywords: '{keywords[:50]}'")
+        print(f"[INFO] ⏱️ Durata audio: {audio_duration:.1f}s", flush=True)
+        print(f"[INFO] 📺 Video: '{video_title[:50]}'", flush=True)
+        print(f"[INFO] 🔑 Keywords: '{keywords[:50]}'", flush=True)
         
-        # 2. Scarica clip basate sui dati del video
         script_words = script.lower().split()
         words_per_second = len(script_words) / audio_duration if audio_duration > 0 else 2.5
         num_scenes = MAX_CLIPS
         avg_scene_duration = audio_duration / num_scenes
+        
+        print(f"[INFO] 🎞️ Cercando {num_scenes} clip...", flush=True)
         
         scene_clips = []
         for i in range(num_scenes):
             word_index = int((i * audio_duration / num_scenes) * words_per_second)
             scene_context = " ".join(script_words[word_index: word_index + 7]) if word_index < len(script_words) else ""
             
-            # 🔥 QUERY DINAMICA basata su tutti i dati del video
             scene_query = build_dynamic_query(video_title, keywords, description, script, scene_context)
             
             clip_path, _ = fetch_clip_for_scene(i + 1, scene_query, avg_scene_duration)
@@ -286,9 +266,9 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
         if len(scene_clips) < 3:
             raise RuntimeError(f"Troppe poche clip: {len(scene_clips)}/{num_scenes}")
         
-        print(f"[SUCCESS] ✅ {len(scene_clips)} clip scaricate!")
+        print(f"[SUCCESS] ✅ {len(scene_clips)}/{num_scenes} clip scaricate!", flush=True)
         
-        # 3. Normalizza clip a 1080x1920 (9:16)
+        print(f"[INFO] 🔧 Normalizzazione clip a 9:16...", flush=True)
         normalized_clips = []
         for i, clip_path in enumerate(scene_clips):
             try:
@@ -304,6 +284,8 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
                 
                 if os.path.exists(normalized_path) and os.path.getsize(normalized_path) > 1000:
                     normalized_clips.append(normalized_path)
+                    if (i + 1) % 2 == 0:
+                        print(f"[INFO] 🔧 Normalizzate {i + 1}/{len(scene_clips)} clip", flush=True)
                     
                 try:
                     os.unlink(clip_path)
@@ -311,22 +293,20 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
                     pass
                     
             except Exception as e:
-                print(f"[WARNING] Skip clip {i}: {e}")
+                print(f"[WARNING] Skip clip {i + 1}: {e}", flush=True)
         
         if not normalized_clips:
             raise RuntimeError("Nessuna clip normalizzata")
         
-        print(f"[INFO] {len(normalized_clips)} clip normalizzate")
+        print(f"[SUCCESS] ✅ {len(normalized_clips)} clip normalizzate!", flush=True)
         
-        # 4. Calcola se serve loop
         total_clips_duration = sum(get_video_duration(p) for p in normalized_clips)
         
-        # 5. Crea concat list
         concat_list_tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
         
         if total_clips_duration < audio_duration and len(normalized_clips) > 1:
             loops_needed = math.ceil(audio_duration / total_clips_duration)
-            print(f"[INFO] Loop clip {loops_needed} volte per coprire {audio_duration:.1f}s")
+            print(f"[INFO] 🔁 Loop {loops_needed}x per coprire {audio_duration:.1f}s", flush=True)
             for _ in range(loops_needed):
                 for norm_path in normalized_clips:
                     concat_list_tmp.write(f"file '{norm_path}'\n")
@@ -336,7 +316,7 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
         
         concat_list_tmp.close()
         
-        # 6. Concat clip
+        print(f"[INFO] 🎞️ Concatenazione clip...", flush=True)
         video_looped_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         video_looped_path = video_looped_tmp.name
         video_looped_tmp.close()
@@ -350,14 +330,13 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
         
         os.unlink(concat_list_tmp.name)
         
-        # 7. Merge video + audio
+        print(f"[INFO] 🎵 Merge video + audio...", flush=True)
         subprocess.run([
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", video_looped_path, "-i", audio_path,
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", output_path
         ], timeout=MAX_DURATION, check=True)
         
-        # Cleanup
         try:
             os.unlink(video_looped_path)
             for norm_path in normalized_clips:
@@ -365,18 +344,18 @@ def create_short_video_with_clips(video_data, audio_path, output_path, platform)
         except:
             pass
         
-        print(f"[SUCCESS] Video {platform} creato!")
+        print(f"[SUCCESS] ✅ Video {platform} creato!", flush=True)
         return output_path
         
     except Exception as e:
-        print(f"[ERROR] Errore creazione video {platform}: {e}")
+        print(f"[ERROR] ❌ Errore creazione video {platform}: {e}", flush=True)
         traceback.print_exc()
         raise
 
 
 def upload_to_r2(file_path, channel_name, platform):
     """Carica video su R2"""
-    print(f"[INFO] Upload R2 per {platform}...")
+    print(f"[INFO] ☁️ Upload R2 per {platform}...", flush=True)
     
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -394,44 +373,48 @@ def upload_to_r2(file_path, channel_name, platform):
         )
         
         video_url = f"https://pub-{R2_ACCOUNT_ID}.r2.dev/{s3_key}"
-        print(f"[SUCCESS] Video caricato!")
+        print(f"[SUCCESS] ✅ Upload completato!", flush=True)
+        print(f"[INFO] 🔗 URL: {video_url}", flush=True)
         return video_url
     except Exception as e:
-        print(f"[ERROR] Upload R2: {e}")
+        print(f"[ERROR] ❌ Upload R2: {e}", flush=True)
         raise
 
 
 def process_video_generation_background(task_id, videos, channel_name, row_number, sheet_id, webhook_url):
     """Processa 4 video in background"""
-    print(f"\n[INFO] 🎬 Task {task_id} START")
+    print(f"\n{'='*80}", flush=True)
+    print(f"[INFO] 🎬 TASK {task_id} START", flush=True)
+    print(f"[INFO] Channel: {channel_name}", flush=True)
+    print(f"[INFO] Row: {row_number}", flush=True)
+    print(f"[INFO] Videos: {len(videos)}", flush=True)
+    print(f"{'='*80}\n", flush=True)
     
     try:
         video_urls = {}
         
-        for video_data in videos:
+        for idx, video_data in enumerate(videos, 1):
             platform = video_data.get('platform')
             script = video_data.get('script')
             audio_url = video_data.get('audio_url')
             
-            print(f"\n[INFO] === Video {platform} ===")
+            print(f"\n{'='*80}", flush=True)
+            print(f"[INFO] 🎥 VIDEO {idx}/4: {platform.upper()}", flush=True)
+            print(f"{'='*80}", flush=True)
             
             try:
-                # 1. Download audio
                 with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
                     audio_path = audio_file.name
                 
                 download_audio_from_url(audio_url, audio_path)
                 
-                # 2. Crea video con clip dinamiche
                 with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
                     video_path = video_file.name
                 
                 create_short_video_with_clips(video_data, audio_path, video_path, platform)
                 
-                # 3. Upload R2
                 video_url = upload_to_r2(video_path, channel_name, platform)
                 
-                # 4. Cleanup
                 try:
                     os.unlink(audio_path)
                     os.unlink(video_path)
@@ -439,15 +422,15 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                     pass
                 
                 video_urls[platform] = video_url
-                print(f"[SUCCESS] ✅ {platform} OK!")
+                print(f"\n[SUCCESS] ✅✅✅ {platform.upper()} COMPLETATO! ✅✅✅\n", flush=True)
                 
             except Exception as e:
-                print(f"[ERROR] ❌ {platform}: {e}")
+                print(f"\n[ERROR] ❌❌❌ {platform.upper()} FALLITO: {e} ❌❌❌\n", flush=True)
                 traceback.print_exc()
                 continue
         
-        # Webhook n8n
         if webhook_url and video_urls:
+            print(f"\n[INFO] 🔔 Invio risultati a n8n...", flush=True)
             webhook_payload = {
                 'status': 'completed',
                 'task_id': task_id,
@@ -464,10 +447,15 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
             
             send_n8n_webhook(webhook_payload)
         
-        print(f"\n[SUCCESS] 🎉 Task {task_id} DONE! {len(video_urls)}/4 video")
+        print(f"\n{'='*80}", flush=True)
+        print(f"[SUCCESS] 🎉🎉🎉 TASK {task_id} COMPLETATO! 🎉🎉🎉", flush=True)
+        print(f"[INFO] Videos generati: {len(video_urls)}/4", flush=True)
+        print(f"{'='*80}\n", flush=True)
         
     except Exception as e:
-        print(f"\n[ERROR] ❌ Task {task_id}: {e}")
+        print(f"\n{'='*80}", flush=True)
+        print(f"[ERROR] ❌❌❌ TASK {task_id} FALLITO: {e} ❌❌❌", flush=True)
+        print(f"{'='*80}\n", flush=True)
         traceback.print_exc()
         
         if webhook_url:
@@ -491,9 +479,9 @@ def health():
 def generate_videos():
     """Endpoint generico per tutti i canali"""
     try:
-        print("\n" + "="*60)
-        print("=== REQUEST ===")
-        print("="*60)
+        print("\n" + "="*80, flush=True)
+        print("=== NUOVA RICHIESTA ===", flush=True)
+        print("="*80, flush=True)
         
         body_data = request.get_json(force=True)
         
@@ -503,7 +491,6 @@ def generate_videos():
         sheet_id = None
         webhook_callback_url = None
         
-        # Formato Object
         if 'youtube_shorts' in body_data:
             first_video = body_data.get('youtube_shorts', {})
             channel_name = first_video.get('channel_name')
@@ -516,7 +503,6 @@ def generate_videos():
                     video_data['platform'] = platform
                     videos_list.append(video_data)
         
-        # Formato Array
         elif 'videos' in body_data:
             videos_list = body_data.get('videos', [])
             channel_name = body_data.get('channel_name')
@@ -536,15 +522,19 @@ def generate_videos():
         
         task_id = str(uuid.uuid4())
         
-        print(f"\n[INFO] 🚀 Task {task_id}")
-        print(f"[INFO] Channel: {channel_name}")
-        print(f"[INFO] Videos: {len(videos_list)}")
+        print(f"\n[INFO] 🚀 Task ID: {task_id}", flush=True)
+        print(f"[INFO] 📺 Channel: {channel_name}", flush=True)
+        print(f"[INFO] 📊 Row: {row_number}", flush=True)
+        print(f"[INFO] 🎥 Videos: {len(videos_list)}", flush=True)
         
         thread = Thread(
             target=process_video_generation_background,
-            args=(task_id, videos_list, channel_name, row_number, sheet_id, webhook_callback_url)
+            args=(task_id, videos_list, channel_name, row_number, sheet_id, webhook_callback_url),
+            daemon=True
         )
         thread.start()
+        
+        print(f"[SUCCESS] ✅ Task {task_id} avviato in background!", flush=True)
         
         return jsonify({
             "task_id": task_id,
@@ -555,18 +545,18 @@ def generate_videos():
         }), 202
         
     except Exception as e:
-        print(f"\n[ERROR] ❌ {e}")
+        print(f"\n[ERROR] ❌ Errore endpoint: {e}", flush=True)
         traceback.print_exc()
         return jsonify({"error": str(e), "success": False}), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    print(f"\n{'='*60}")
-    print(f"🚀 Social Shorts Generator (GENERICO)")
-    print(f"📍 Port: {port}")
-    print(f"🎬 Clips per video: {MAX_CLIPS}")
-    print(f"🔑 Pexels: {'✅' if PEXELS_API_KEY else '❌'}")
-    print(f"🔑 Pixabay: {'✅' if PIXABAY_API_KEY else '❌'}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*80}", flush=True)
+    print(f"🚀 Social Shorts Generator (GENERICO)", flush=True)
+    print(f"📍 Port: {port}", flush=True)
+    print(f"🎬 Clips per video: {MAX_CLIPS}", flush=True)
+    print(f"🔑 Pexels: {'✅' if PEXELS_API_KEY else '❌'}", flush=True)
+    print(f"🔑 Pixabay: {'✅' if PIXABAY_API_KEY else '❌'}", flush=True)
+    print(f"{'='*80}\n", flush=True)
     app.run(host='0.0.0.0', port=port, debug=False)
