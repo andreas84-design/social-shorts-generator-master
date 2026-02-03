@@ -13,7 +13,7 @@ import subprocess
 import math
 import random
 from threading import Thread
-import sys
+from collections import Counter
 
 app = Flask(__name__)
 
@@ -43,23 +43,6 @@ s3_client = boto3.client(
 
 # ==================== FUNZIONI HELPER GENERICHE ====================
 
-def send_n8n_webhook(payload):
-    """Invia webhook a n8n"""
-    webhook_url = payload.get('webhook_callback_url') or N8N_CALLBACK_WEBHOOK_URL
-    
-    if not webhook_url:
-        print("[WARNING] ⚠️ Nessun webhook URL configurato", flush=True)
-        return
-    
-    try:
-        print(f"[INFO] 🔔 Invio webhook a n8n", flush=True)
-        response = requests.post(webhook_url, json=payload, timeout=10, headers={'Content-Type': 'application/json'})
-        print(f"[SUCCESS] ✅ Webhook inviato: {response.status_code}", flush=True)
-        return response.json() if response.ok else None
-    except Exception as e:
-        print(f"[ERROR] ❌ Errore webhook: {e}", flush=True)
-
-
 def extract_keywords_from_text(text, max_keywords=10):
     """Estrae parole chiave significative da un testo (GENERICO)"""
     if not text:
@@ -72,7 +55,6 @@ def extract_keywords_from_text(text, max_keywords=10):
     words = text.lower().split()
     keywords = [w for w in words if len(w) > 3 and w not in stopwords and w.isalpha()]
     
-    from collections import Counter
     word_freq = Counter(keywords)
     
     return [word for word, _ in word_freq.most_common(max_keywords)]
@@ -387,6 +369,7 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
     print(f"[INFO] 🎬 TASK {task_id} START", flush=True)
     print(f"[INFO] Channel: {channel_name}", flush=True)
     print(f"[INFO] Row: {row_number}", flush=True)
+    print(f"[INFO] Sheet ID: {sheet_id}", flush=True)
     print(f"[INFO] Videos: {len(videos)}", flush=True)
     print(f"{'='*80}\n", flush=True)
     
@@ -429,27 +412,49 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                 traceback.print_exc()
                 continue
         
-        if webhook_url and video_urls:
-            print(f"\n[INFO] 🔔 Invio risultati a n8n...", flush=True)
-            webhook_payload = {
-                'status': 'completed',
-                'task_id': task_id,
-                'row_number': row_number,
-                'sheet_id': sheet_id,
-                'channel_name': channel_name,
-                'videos': [
-                    {'platform': 'youtube_shorts', 'video_url': video_urls.get('youtube_shorts', '')},
-                    {'platform': 'tiktok', 'video_url': video_urls.get('tiktok', '')},
-                    {'platform': 'instagram_reels', 'video_url': video_urls.get('instagram_reels', '')},
-                    {'platform': 'facebook_reels', 'video_url': video_urls.get('facebook_reels', '')}
-                ]
-            }
+        # ✅ WEBHOOK N8N - STESSA LOGICA AGENTE YOUTUBE
+        if video_urls:
+            final_webhook_url = webhook_url if webhook_url else N8N_CALLBACK_WEBHOOK_URL
             
-            send_n8n_webhook(webhook_payload)
+            if final_webhook_url:
+                print(f"\n[INFO] 🔔 Invio webhook a n8n: {final_webhook_url[:80]}...", flush=True)
+                
+                webhook_payload = {
+                    'status': 'completed',
+                    'task_id': task_id,
+                    'row_number': row_number,
+                    'sheet_id': sheet_id,
+                    'channel_name': channel_name,
+                    'youtube_shorts_url': video_urls.get('youtube_shorts', ''),
+                    'tiktok_url': video_urls.get('tiktok', ''),
+                    'instagram_reels_url': video_urls.get('instagram_reels', ''),
+                    'facebook_reels_url': video_urls.get('facebook_reels', ''),
+                    'total_videos': len(video_urls)
+                }
+                
+                try:
+                    response = requests.post(
+                        final_webhook_url,
+                        json=webhook_payload,
+                        headers={'Content-Type': 'application/json'},
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    print(f"[SUCCESS] ✅ Webhook n8n inviato: {response.status_code}", flush=True)
+                    print(f"[INFO] Response: {response.text[:200]}", flush=True)
+                except requests.exceptions.RequestException as e:
+                    print(f"[ERROR] ❌ Errore webhook n8n: {e}", flush=True)
+                    traceback.print_exc()
+            else:
+                print(f"[WARNING] ⚠️ Nessun webhook URL configurato", flush=True)
+        else:
+            print(f"[WARNING] ⚠️ Nessun video generato, webhook non inviato", flush=True)
         
         print(f"\n{'='*80}", flush=True)
         print(f"[SUCCESS] 🎉🎉🎉 TASK {task_id} COMPLETATO! 🎉🎉🎉", flush=True)
         print(f"[INFO] Videos generati: {len(video_urls)}/4", flush=True)
+        for platform, url in video_urls.items():
+            print(f"[INFO] 🔗 {platform}: {url}", flush=True)
         print(f"{'='*80}\n", flush=True)
         
     except Exception as e:
@@ -458,14 +463,28 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
         print(f"{'='*80}\n", flush=True)
         traceback.print_exc()
         
-        if webhook_url:
-            send_n8n_webhook({
-                'status': 'failed',
-                'task_id': task_id,
-                'row_number': row_number,
-                'sheet_id': sheet_id,
-                'error': str(e)
-            })
+        # Webhook errore
+        final_webhook_url = webhook_url if webhook_url else N8N_CALLBACK_WEBHOOK_URL
+        if final_webhook_url:
+            try:
+                error_payload = {
+                    'status': 'failed',
+                    'task_id': task_id,
+                    'row_number': row_number,
+                    'sheet_id': sheet_id,
+                    'channel_name': channel_name,
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
+                }
+                requests.post(
+                    final_webhook_url,
+                    json=error_payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=30
+                )
+                print(f"[INFO] Webhook errore inviato a n8n", flush=True)
+            except Exception as webhook_err:
+                print(f"[ERROR] Impossibile inviare webhook errore: {webhook_err}", flush=True)
 
 
 # ==================== ENDPOINT ====================
@@ -491,10 +510,13 @@ def generate_videos():
         sheet_id = None
         webhook_callback_url = None
         
+        # Formato Object
         if 'youtube_shorts' in body_data:
             first_video = body_data.get('youtube_shorts', {})
             channel_name = first_video.get('channel_name')
             row_number = first_video.get('row_number')
+            sheet_id = first_video.get('sheet_id')
+            webhook_callback_url = first_video.get('webhook_callback_url')
             
             for key, platform in [('youtube_shorts', 'youtube_shorts'), ('tiktok', 'tiktok'), 
                                   ('instagram_reels', 'instagram_reels'), ('facebook_reels', 'facebook_reels')]:
@@ -503,6 +525,7 @@ def generate_videos():
                     video_data['platform'] = platform
                     videos_list.append(video_data)
         
+        # Formato Array
         elif 'videos' in body_data:
             videos_list = body_data.get('videos', [])
             channel_name = body_data.get('channel_name')
@@ -520,12 +543,18 @@ def generate_videos():
         row_number = row_number or 0
         sheet_id = sheet_id or "unknown"
         
+        # Fallback webhook
+        if not webhook_callback_url:
+            webhook_callback_url = N8N_CALLBACK_WEBHOOK_URL
+        
         task_id = str(uuid.uuid4())
         
         print(f"\n[INFO] 🚀 Task ID: {task_id}", flush=True)
         print(f"[INFO] 📺 Channel: {channel_name}", flush=True)
         print(f"[INFO] 📊 Row: {row_number}", flush=True)
+        print(f"[INFO] 📋 Sheet ID: {sheet_id}", flush=True)
         print(f"[INFO] 🎥 Videos: {len(videos_list)}", flush=True)
+        print(f"[INFO] 🔔 Webhook: {webhook_callback_url[:60] if webhook_callback_url else 'NONE'}", flush=True)
         
         thread = Thread(
             target=process_video_generation_background,
