@@ -200,10 +200,28 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: floa
 
 
 def download_audio_from_url(audio_url, output_path):
-    """Scarica audio da URL"""
-    print(f"[INFO] Download audio: {audio_url[:80]}...")
+    """Scarica audio da URL o decodifica da base64"""
+    if not audio_url:
+        raise ValueError("audio_url è None o vuoto")
+    
+    print(f"[INFO] Processing audio...")
     
     try:
+        # Se è un data URL base64
+        if audio_url.startswith('data:audio'):
+            print("[INFO] Decodifica audio base64...")
+            # Rimuovi header "data:audio/mpeg;base64,"
+            base64_data = audio_url.split(',')[1] if ',' in audio_url else audio_url
+            audio_bytes = base64.b64decode(base64_data)
+            
+            with open(output_path, 'wb') as f:
+                f.write(audio_bytes)
+            
+            print(f"[SUCCESS] Audio decodificato ({len(audio_bytes)} bytes)")
+            return output_path
+        
+        # Altrimenti è un URL normale
+        print(f"[INFO] Download audio da URL: {audio_url[:80]}...")
         response = requests.get(audio_url, timeout=30)
         response.raise_for_status()
         
@@ -212,8 +230,9 @@ def download_audio_from_url(audio_url, output_path):
         
         print(f"[SUCCESS] Audio scaricato")
         return output_path
+        
     except Exception as e:
-        print(f"[ERROR] Errore download audio: {e}")
+        print(f"[ERROR] Errore audio: {e}")
         raise
 
 
