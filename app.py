@@ -36,7 +36,7 @@ R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 
-# N8N Webhook (NUOVO!)
+# N8N Webhook
 N8N_CALLBACK_WEBHOOK_URL = os.environ.get('N8N_CALLBACK_WEBHOOK_URL')
 
 # Configurazione R2
@@ -56,9 +56,7 @@ tts_client = texttospeech.TextToSpeechClient(credentials=tts_credentials)
 # ==================== FUNZIONI HELPER ====================
 
 def send_n8n_webhook(payload):
-    """
-    Invia webhook a n8n quando video sono pronti (NUOVO!)
-    """
+    """Invia webhook a n8n quando video sono pronti"""
     webhook_url = payload.get('webhook_callback_url') or N8N_CALLBACK_WEBHOOK_URL
     
     if not webhook_url:
@@ -83,14 +81,33 @@ def send_n8n_webhook(payload):
         traceback.print_exc()
 
 
+def download_audio_from_url(audio_url, output_path):
+    """
+    Scarica audio da URL e salva su file (NUOVO!)
+    """
+    print(f"[INFO] Download audio da URL: {audio_url}")
+    
+    try:
+        response = requests.get(audio_url, timeout=30)
+        response.raise_for_status()
+        
+        with open(output_path, 'wb') as f:
+            f.write(response.content)
+        
+        print(f"[SUCCESS] Audio scaricato: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"[ERROR] Errore download audio: {e}")
+        traceback.print_exc()
+        raise
+
+
 def text_to_speech_from_base64(audio_base64, output_path):
-    """
-    Decodifica audio base64 e salva su file (NUOVO!)
-    """
+    """Decodifica audio base64 e salva su file"""
     print(f"[INFO] Decodifica audio base64...")
     
     try:
-        # Rimuovi header data URL se presente
         if ',' in audio_base64:
             audio_base64 = audio_base64.split(',')[1]
         
@@ -109,9 +126,7 @@ def text_to_speech_from_base64(audio_base64, output_path):
 
 
 def text_to_speech(text, output_path):
-    """
-    Converte testo in audio usando Google TTS
-    """
+    """Converte testo in audio usando Google TTS"""
     print(f"[INFO] Generazione audio con Google TTS...")
     
     try:
@@ -148,24 +163,19 @@ def text_to_speech(text, output_path):
 
 
 def create_short_video(script, audio_path, output_path, platform):
-    """
-    Crea video short 9:16 con sfondo, audio e sottotitoli
-    """
+    """Crea video short 9:16 con sfondo, audio e sottotitoli"""
     print(f"[INFO] Creazione video per {platform}...")
     
     try:
-        # Parametri video 9:16
         width, height = 1080, 1920
         duration_audio = AudioFileClip(audio_path).duration
         
-        # Crea sfondo colorato con gradiente
         from PIL import Image, ImageDraw
         import numpy as np
         
         img = Image.new('RGB', (width, height), color=(30, 30, 50))
         draw = ImageDraw.Draw(img)
         
-        # Aggiungi gradiente verticale
         for y in range(height):
             r = int(30 + (y / height) * 40)
             g = int(30 + (y / height) * 50)
@@ -173,11 +183,8 @@ def create_short_video(script, audio_path, output_path, platform):
             draw.line([(0, y), (width, y)], fill=(r, g, b))
         
         img_array = np.array(img)
-        
-        # Crea clip immagine
         background_clip = ImageClip(img_array).set_duration(duration_audio)
         
-        # Aggiungi testo (sottotitoli)
         txt_clip = TextClip(
             script,
             fontsize=60,
@@ -188,14 +195,10 @@ def create_short_video(script, audio_path, output_path, platform):
             align='center'
         ).set_position('center').set_duration(duration_audio)
         
-        # Aggiungi audio
         audio_clip = AudioFileClip(audio_path)
-        
-        # Componi video
         final_clip = CompositeVideoClip([background_clip, txt_clip])
         final_clip = final_clip.set_audio(audio_clip)
         
-        # Esporta
         final_clip.write_videofile(
             output_path,
             fps=30,
@@ -205,7 +208,6 @@ def create_short_video(script, audio_path, output_path, platform):
             threads=4
         )
         
-        # Cleanup
         background_clip.close()
         txt_clip.close()
         audio_clip.close()
@@ -221,16 +223,13 @@ def create_short_video(script, audio_path, output_path, platform):
 
 
 def upload_to_r2(file_path, channel_name, platform):
-    """
-    Carica video su R2 Cloudflare
-    """
+    """Carica video su R2 Cloudflare"""
     print(f"[INFO] Upload su R2 per {platform}...")
     
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         
-        # Sanitizza nome canale per path
         channel_safe = channel_name.replace(" ", "_").replace("/", "_")
         platform_safe = platform.replace(" ", "_")
         
@@ -255,9 +254,7 @@ def upload_to_r2(file_path, channel_name, platform):
 
 
 def process_video_generation_background(task_id, videos, channel_name, row_number, sheet_id, webhook_url):
-    """
-    Processa generazione video in background (NUOVO!)
-    """
+    """Processa generazione video in background"""
     print(f"\n[INFO] 🎬 Background processing started for task {task_id}")
     
     try:
@@ -266,17 +263,25 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
         for video_data in videos:
             platform = video_data.get('platform')
             script = video_data.get('script')
+            audio_url = video_data.get('audio_url')
             audio_base64 = video_data.get('audio_base64')
             title = video_data.get('title')
             
             print(f"\n[INFO] === Generazione video per {platform} ===")
             
             try:
-                # 1. Decodifica audio base64
+                # 1. Ottieni audio
                 with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as audio_file:
                     audio_path = audio_file.name
                 
-                text_to_speech_from_base64(audio_base64, audio_path)
+                # Prova prima con audio_url, poi con audio_base64
+                if audio_url:
+                    download_audio_from_url(audio_url, audio_path)
+                elif audio_base64:
+                    text_to_speech_from_base64(audio_base64, audio_path)
+                else:
+                    # Fallback: genera audio da script
+                    text_to_speech(script, audio_path)
                 
                 # 2. Crea video
                 with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as video_file:
@@ -326,7 +331,6 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
         print(f"\n[ERROR] ❌ Errore task {task_id}: {e}")
         traceback.print_exc()
         
-        # Invia webhook di errore
         if webhook_url:
             error_payload = {
                 'status': 'failed',
@@ -349,30 +353,95 @@ def health():
 @app.route('/api/generate', methods=['POST'])
 def generate_videos():
     """
-    Endpoint per generare 4 video social da n8n (NUOVO!)
+    Endpoint per generare 4 video social da n8n (FIXATO!)
     """
     try:
-        data = request.json
+        print("\n" + "="*60)
+        print("=== INCOMING REQUEST DEBUG ===")
+        print("="*60)
         
-        # Estrai parametri
-        videos = data.get('videos', [])
-        channel_name = data.get('channel_name')
-        row_number = data.get('row_number')
-        sheet_id = data.get('sheet_id')
-        webhook_callback_url = data.get('webhook_callback_url')
+        # Log headers
+        print("\n📋 HEADERS:")
+        for key, value in request.headers.items():
+            print(f"  {key}: {value}")
+        
+        # Log raw body
+        print("\n📦 RAW BODY:")
+        body_data = request.get_json(force=True)
+        print(f"  Body keys: {list(body_data.keys()) if body_data else 'None'}")
+        
+        # NUOVO: Supporta sia formato object che array
+        videos_list = []
+        channel_name = None
+        row_number = None
+        sheet_id = None
+        webhook_callback_url = None
+        
+        # Formato 1: Object con 4 chiavi platform (DA N8N)
+        if 'youtube_shorts' in body_data:
+            print("\n✅ Formato rilevato: OBJECT con 4 platform keys")
+            
+            # Estrai dati comuni dal primo video
+            first_video = body_data.get('youtube_shorts', {})
+            channel_name = first_video.get('channel_name')
+            row_number = first_video.get('row_number')
+            
+            # Converti in array di videos
+            platform_mapping = {
+                'youtube_shorts': 'youtube_shorts',
+                'tiktok': 'tiktok',
+                'instagram_reels': 'instagram_reels',
+                'facebook_reels': 'facebook_reels'
+            }
+            
+            for key, platform in platform_mapping.items():
+                if key in body_data:
+                    video_data = body_data[key]
+                    video_data['platform'] = platform
+                    videos_list.append(video_data)
+                    print(f"  ✅ {platform}: Present")
+                else:
+                    print(f"  ❌ {platform}: MISSING!")
+        
+        # Formato 2: Array videos (LEGACY)
+        elif 'videos' in body_data:
+            print("\n✅ Formato rilevato: ARRAY videos (legacy)")
+            videos_list = body_data.get('videos', [])
+            channel_name = body_data.get('channel_name')
+            row_number = body_data.get('row_number')
+            sheet_id = body_data.get('sheet_id')
+            webhook_callback_url = body_data.get('webhook_callback_url')
+        
+        else:
+            print("\n❌ Formato non riconosciuto!")
+            return jsonify({
+                "error": "Formato payload non valido. Servono youtube_shorts, tiktok, instagram_reels, facebook_reels",
+                "received_keys": list(body_data.keys()),
+                "success": False
+            }), 400
+        
+        print(f"\n📊 PARSED DATA:")
+        print(f"  Videos count: {len(videos_list)}")
+        print(f"  Channel: {channel_name}")
+        print(f"  Row: {row_number}")
+        print(f"  Sheet ID: {sheet_id}")
         
         # Validazione
-        if not videos or len(videos) != 4:
+        if len(videos_list) != 4:
             return jsonify({
-                "error": "Servono esattamente 4 video (youtube_shorts, tiktok, instagram_reels, facebook_reels)",
+                "error": f"Servono esattamente 4 video, ricevuti {len(videos_list)}",
+                "received_count": len(videos_list),
                 "success": False
             }), 400
         
-        if not all([channel_name, row_number, sheet_id]):
-            return jsonify({
-                "error": "Parametri mancanti: channel_name, row_number, sheet_id",
-                "success": False
-            }), 400
+        if not channel_name:
+            channel_name = "Unknown Channel"
+        
+        if not row_number:
+            row_number = 0
+        
+        if not sheet_id:
+            sheet_id = "unknown"
         
         # Genera task ID
         task_id = str(uuid.uuid4())
@@ -382,13 +451,13 @@ def generate_videos():
         print(f"[INFO] Task ID: {task_id}")
         print(f"[INFO] Channel: {channel_name}")
         print(f"[INFO] Row: {row_number}")
-        print(f"[INFO] Videos: {len(videos)}")
+        print(f"[INFO] Videos: {len(videos_list)}")
         print(f"{'='*60}\n")
         
-        # Avvia processing in background thread
+        # Avvia processing in background
         thread = Thread(
             target=process_video_generation_background,
-            args=(task_id, videos, channel_name, row_number, sheet_id, webhook_callback_url)
+            args=(task_id, videos_list, channel_name, row_number, sheet_id, webhook_callback_url)
         )
         thread.start()
         
@@ -396,8 +465,9 @@ def generate_videos():
         return jsonify({
             "task_id": task_id,
             "status": "processing",
-            "message": f"{len(videos)} video in coda per generazione",
-            "estimated_time": "30-60 secondi"
+            "message": f"{len(videos_list)} video in coda per generazione",
+            "estimated_time": "30-60 secondi",
+            "success": True
         }), 202
         
     except Exception as e:
@@ -411,13 +481,11 @@ def generate_videos():
 
 @app.route('/generate-shorts', methods=['POST'])
 def generate_shorts():
-    """
-    Endpoint legacy per generare short da video YouTube (MANTIENI PER RETROCOMPATIBILITÀ)
-    """
+    """Endpoint legacy per generare short da video YouTube"""
     try:
         data = request.json
-        
-        # ... (mantieni codice originale) ...
+        # ... (mantieni codice originale se esiste) ...
+        return jsonify({"message": "Legacy endpoint, use /api/generate instead"}), 200
         
     except Exception as e:
         print(f"\n[ERROR] ❌ ERRORE GENERALE: {e}")
