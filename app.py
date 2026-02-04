@@ -23,6 +23,7 @@ R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
 R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
+R2_PUBLIC_BASE_URL = os.environ.get('R2_PUBLIC_BASE_URL')  # ✅ AGGIUNTO!
 
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY')
 PIXABAY_API_KEY = os.environ.get('PIXABAY_API_KEY')
@@ -354,7 +355,9 @@ def upload_to_r2(file_path, channel_name, platform):
             ExtraArgs={'ContentType': 'video/mp4'}
         )
         
-        video_url = f"https://pub-{R2_ACCOUNT_ID}.r2.dev/{s3_key}"
+        # ✅ USA R2_PUBLIC_BASE_URL invece di costruire manualmente
+        video_url = f"{R2_PUBLIC_BASE_URL}/{s3_key}"
+        
         print(f"[SUCCESS] ✅ Upload completato!", flush=True)
         print(f"[INFO] 🔗 URL: {video_url}", flush=True)
         return video_url
