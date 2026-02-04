@@ -375,11 +375,13 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
     
     try:
         video_urls = {}
+        video_descriptions = {}  # ✅ NUOVO: Salva descrizioni
         
         for idx, video_data in enumerate(videos, 1):
             platform = video_data.get('platform')
             script = video_data.get('script')
             audio_url = video_data.get('audio_url')
+            description = video_data.get('description', '')  # ✅ ESTRAI DESCRIZIONE
             
             print(f"\n{'='*80}", flush=True)
             print(f"[INFO] 🎥 VIDEO {idx}/4: {platform.upper()}", flush=True)
@@ -405,6 +407,7 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                     pass
                 
                 video_urls[platform] = video_url
+                video_descriptions[platform] = description  # ✅ SALVA DESCRIZIONE
                 print(f"\n[SUCCESS] ✅✅✅ {platform.upper()} COMPLETATO! ✅✅✅\n", flush=True)
                 
             except Exception as e:
@@ -412,7 +415,7 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                 traceback.print_exc()
                 continue
         
-        # ✅ WEBHOOK N8N - STESSA LOGICA AGENTE YOUTUBE
+        # ✅ WEBHOOK N8N CON DESCRIZIONI
         if video_urls:
             final_webhook_url = webhook_url if webhook_url else N8N_CALLBACK_WEBHOOK_URL
             
@@ -425,10 +428,31 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                     'row_number': row_number,
                     'sheet_id': sheet_id,
                     'channel_name': channel_name,
+                    
+                    # YouTube Shorts
                     'youtube_shorts_url': video_urls.get('youtube_shorts', ''),
+                    'youtube_shorts': {
+                        'description': video_descriptions.get('youtube_shorts', '')  # ✅ AGGIUNGI!
+                    },
+                    
+                    # TikTok
                     'tiktok_url': video_urls.get('tiktok', ''),
+                    'tiktok': {
+                        'description': video_descriptions.get('tiktok', '')  # ✅ AGGIUNGI!
+                    },
+                    
+                    # Instagram Reels
                     'instagram_reels_url': video_urls.get('instagram_reels', ''),
+                    'instagram_reels': {
+                        'description': video_descriptions.get('instagram_reels', '')  # ✅ AGGIUNGI!
+                    },
+                    
+                    # Facebook Reels
                     'facebook_reels_url': video_urls.get('facebook_reels', ''),
+                    'facebook_reels': {
+                        'description': video_descriptions.get('facebook_reels', '')  # ✅ AGGIUNGI!
+                    },
+                    
                     'total_videos': len(video_urls)
                 }
                 
@@ -442,6 +466,7 @@ def process_video_generation_background(task_id, videos, channel_name, row_numbe
                     response.raise_for_status()
                     print(f"[SUCCESS] ✅ Webhook n8n inviato: {response.status_code}", flush=True)
                     print(f"[INFO] Response: {response.text[:200]}", flush=True)
+                    print(f"[INFO] 📝 Descrizioni inviate per {len(video_descriptions)} piattaforme", flush=True)
                 except requests.exceptions.RequestException as e:
                     print(f"[ERROR] ❌ Errore webhook n8n: {e}", flush=True)
                     traceback.print_exc()
